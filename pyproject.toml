@@ -1,0 +1,14 @@
+[project]
+name = "clef-operator"
+version = "0.1.0"
+description = "Plain-language Clef questions on Nx Meta camera video"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=8", "pytest-timeout>=2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+timeout = 60

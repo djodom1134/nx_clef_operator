@@ -1,0 +1,8 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+build/
+results/clips/
+*.mp4
+*.mkv
