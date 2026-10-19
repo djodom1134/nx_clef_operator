@@ -1,5 +1,10 @@
+import json
+import time
+
+import pytest
+
 from clef_operator.hunter import (
-    CUE_RESCAN_S, DEFAULT_CUES, FOV_RATE, MEMORY_VERSION, PAN_RATE, cue_boost, standout_tiles, zoom_on, QUIET_RECHECK_S, is_quiet, resting, sightings, TILT_RATE, DEFAULT_AVOID, Hunter, HunterConfig, View, ViewStats, aim_at,
+    CUE_RESCAN_S, DEFAULT_CUES, ExternalControl, hopeless, merge_duplicates, obeys, same_spot, FOV_RATE, MEMORY_VERSION, PAN_RATE, cue_boost, standout_tiles, zoom_on, QUIET_RECHECK_S, is_quiet, resting, sightings, TILT_RATE, DEFAULT_AVOID, Hunter, HunterConfig, View, ViewStats, aim_at,
     angle_delta, choose_next, likelihood_questions, move_slowly, prior_from, survey_views, tile_boxes,
 )
 
@@ -58,7 +63,7 @@ def no_crop(jpeg, x, y, w, h):
 def test_move_slowly_caps_speed_wraps_pan_and_stops_on_target():
     ptz = FakePtz(View(350.0, -12.0, 36.9))
     end = move_slowly(ptz, View(10.0, -5.0, 20.0), max_speed=0.1, sleep=ptz.sleep)
-    assert abs(angle_delta(end.pan, 10.0)) < 1.0 and abs(end.tilt + 5.0) < 1.0 and abs(end.fov - 20.0) < 1.5
+    assert abs(angle_delta(end.pan, 10.0)) <= 2.0 and abs(end.tilt + 5.0) <= 2.0 and abs(end.fov - 20.0) <= 2.0
     assert ptz.max_speed_used <= 0.1 + 1e-9 and ptz.speed == (0.0, 0.0, 0.0)
     assert ptz.now > 6  # 20 degrees at about 3 degrees a second: slow and quiet
 
@@ -108,16 +113,16 @@ def test_move_arrives_when_positions_come_late_and_one_axis_ignores_a_zero():
     # Back PTZ: positions refresh once a second, and "pan 0, tilt 0.03" can leave it panning at full speed
     ptz = FakePtz(View(173.8, -9.65, 36.9), lag=1.0, sticky=True)
     end = move_slowly(ptz, View(72.0, 3.0, 36.9), max_speed=0.2, sleep=ptz.sleep)
-    assert abs(angle_delta(end.pan, 72.0)) < 1.0 and abs(end.tilt - 3.0) < 1.0 and ptz.speed == (0.0, 0.0, 0.0)
-    assert all(v.distance(View(72.0, 3.0, 36.9)) < 1e-6 for v in ptz.absolute_moves)  # only a last small hop
-    assert ptz.now < 60
+    assert abs(angle_delta(end.pan, 72.0)) <= 2.0 and abs(end.tilt - 3.0) <= 2.0 and ptz.speed == (0.0, 0.0, 0.0)
+    assert not ptz.absolute_moves  # never a jump: absolute moves ignore their speed and are loud
+    assert ptz.now < 120
 
 
 def test_move_stops_at_the_tilt_end_stop_and_undoes_the_pan_it_caused():
     ptz = FakePtz(View(160.0, -25.0, 36.9), tilt_max=5.0)
     end = move_slowly(ptz, View(160.0, 10.0, 36.9), max_speed=0.2, sleep=ptz.sleep)
     assert end.tilt == 5.0 and ptz.speed == (0.0, 0.0, 0.0)
-    assert abs(angle_delta(end.pan, 160.0)) < 1.0  # pan drifted while tilt was stuck, then was put back
+    assert abs(angle_delta(end.pan, 160.0)) <= 2.0  # pan drifted while tilt was stuck, then was put back
     assert ptz.now < 60  # not driving into the stop until the timeout
 
 
@@ -246,7 +251,7 @@ def test_hunter_finds_a_small_person_in_a_tile_and_zooms_in():
     view, p = found[0]
     assert view.fov < 36.9 and view.pan > 184.0 and p >= 0.7
     assert ptz.max_speed_used <= 0.1 + 1e-9
-    assert hunter.status.state == "stopped" and abs(angle_delta(ptz.pan, 184.0)) < 1.0  # back home
+    assert hunter.status.state == "stopped" and abs(angle_delta(ptz.pan, 184.0)) <= 2.0  # back home
 
 
 def test_an_empty_view_asks_all_tiles_in_one_request():
@@ -257,7 +262,8 @@ def test_an_empty_view_asks_all_tiles_in_one_request():
         asked.append(len(jpeg) if isinstance(jpeg, list) else 1)
         if len(asked) >= 2:
             hunter.stop(wait=False)
-        return {q: {"true": 0.02} for q in questions if q != "_kind"} | {"_kind": kind(ground=1.0)}
+        # Open ground nobody is on (all-low scene answers would make the view hopeless, and its tiles are not asked)
+        return {q: {"true": 0.9 if q == "_ground" else 0.02} for q in questions if q != "_kind"} | {"_kind": kind(ground=1.0)}
 
     cfg = HunterConfig("cam", pan_min=184, pan_max=184.5, tilts=[-12.0], rest_s=1, settle_s=1)
     hunter = Hunter(cfg, ptz, ask, crop=no_crop, sleep=ptz.sleep, clock=lambda: ptz.now)
@@ -355,7 +361,7 @@ def test_home_preset_wins_over_where_the_camera_was_left(tmp_path):
                     memory=tmp_path / "m.json")
     hunter.run()
     assert hunter.home == View(183.9, -12.0, 36.9)
-    assert abs(angle_delta(ptz.pan, 183.9)) < 1.0 and abs(ptz.tilt + 12.0) < 1.0  # stopped: went to the real home
+    assert abs(angle_delta(ptz.pan, 183.9)) <= 2.0 and abs(ptz.tilt + 12.0) <= 2.0  # stopped: went to the real home
     # without the preset, the remembered home is used, not the current position
     again = Hunter(HunterConfig("cam", tiles=1), FakePtz(View(248.4, -45.8, 36.9)), ask, memory=tmp_path / "m.json")
     assert again._load() == View(183.9, -12.0, 36.9)
@@ -565,13 +571,13 @@ def test_zooming_is_one_quick_step_after_a_slow_pan_and_then_the_camera_refocuse
     absolute_times = [t for t, kind in ptz.commands if kind == "absolute"]
     zoom_index = next(i for i, v in enumerate(ptz.absolute_moves) if v.fov == 18.5)
     zoom, zoom_at = ptz.absolute_moves[zoom_index], absolute_times[zoom_index]
-    assert abs(zoom.pan - 200.0) < 1.0 and abs(zoom.tilt + 15.0) < 1.0  # centred first (slowly), then zoomed
+    assert abs(zoom.pan - 200.0) <= 2.0 and abs(zoom.tilt + 15.0) <= 2.0  # centred first (slowly), then zoomed
     assert all(v.fov == 37.0 for v in ptz.absolute_moves[:zoom_index])  # the pan itself stayed wide
     assert ptz.now - zoom_at >= 4.0 + 1.0  # focus and settle before anything else happens
     before = len(ptz.absolute_moves)
     hunter._go(View(150.0, -10.0, 37.0))
     zoom_out = ptz.absolute_moves[before]
-    assert zoom_out.fov == 37.0 and abs(zoom_out.pan - 200.0) < 1.0  # widened first, then the pan
+    assert zoom_out.fov == 37.0 and abs(zoom_out.pan - 200.0) <= 2.0  # widened first, then the pan
 
 
 def test_no_commands_are_sent_while_the_camera_refocuses():
@@ -585,19 +591,21 @@ def test_no_commands_are_sent_while_the_camera_refocuses():
     assert later and min(later) >= zoom_at + 4.0
 
 
-def test_the_hunter_spends_about_three_quarters_of_its_time_wide_then_gets_bored():
-    ptz = FakePtz()
-    hunter = Hunter(HunterConfig("cam", wide_share=0.75), ptz, lambda *a: {})
+def test_the_hunter_watches_wide_for_three_quarters_of_each_cycle_then_gets_bored_and_looks_around():
+    now = [0.0]
+    hunter = Hunter(HunterConfig("cam", wide_share=0.75, cycle_s=240.0), FakePtz(), lambda *a: {}, clock=lambda: now[0])
     hunter.home = View(184.0, -12.0, 37.0)
     wide, close = View(190.0, -10.0, 37.0), View(175.0, -5.0, 18.5)
     hunter.stats = {wide: ViewStats(prior=0.6), close: ViewStats(prior=0.6, found_by="play area")}
-    hunter._spent(wide, 300.0)
-    assert set(hunter._candidates()) == {close}  # all wide lately: look closer
-    hunter._spent(close, 200.0)
-    assert set(hunter._candidates()) == {wide}  # 60% wide: back out
-    hunter.stats = {wide: ViewStats(prior=0.6)}
-    hunter.time_wide, hunter.time_zoomed = 300.0, 0.0
-    assert set(hunter._candidates()) == {wide}  # nothing zoomed to look at yet: stay wide
+    modes = []
+    for t in range(0, 480, 10):
+        now[0] = float(t)
+        modes.append("wide" if set(hunter._candidates()) == {wide} else "close")
+    assert modes.count("wide") / len(modes) == pytest.approx(0.75, abs=0.06)
+    assert "wide" in modes[:3] and "close" in modes  # starts wide, then gets bored
+    hunter.stats = {wide: ViewStats(prior=0.6), close: ViewStats(prior=0.6, avoid=0.9)}
+    now[0] = 1000.0
+    assert set(hunter._candidates()) == {wide}  # nothing close worth a look (blocked): stays wide
 
 
 def test_zoomed_views_can_be_scanned_for_a_second_zoom_level():
@@ -620,3 +628,369 @@ def test_zoomed_views_can_be_scanned_for_a_second_zoom_level():
     hunter.stats[closer] = ViewStats(prior=0.8, found_by="play area")
     hunter._scan_tiles(closer, b"jpeg")
     assert any(v.fov == 9.0 or v.fov == 9.5 for v, s in hunter.stats.items() if s.found_by in ("seat", "path"))
+
+
+def test_only_zoom_ever_uses_an_absolute_move():
+    ptz = FakePtz(View(184.0, -12.0, 37.0), lag=1.0)
+    hunter = Hunter(HunterConfig("cam", rest_s=0.0, settle_s=1.0, focus_s=4.0), ptz, lambda *a: {},
+                    sleep=ptz.sleep, clock=lambda: ptz.now)
+    for view in (View(248.5, -41.5, 37.0), View(184.0, -12.0, 37.0), View(190.0, -10.0, 18.5), View(72.0, -10.0, 37.0)):
+        hunter._go(view)
+    assert all(v.fov != prev for v, prev in zip(ptz.absolute_moves, [37.0] + [v.fov for v in ptz.absolute_moves]))
+    assert [v.fov for v in ptz.absolute_moves] == [18.5, 37.0]  # zoom in, zoom out: nothing else jumps
+
+
+def test_keepalive_sends_a_stop_only_when_idle_and_never_while_refocusing_or_moving():
+    ptz = FakePtz()
+    hunter = Hunter(HunterConfig("cam", keepalive_s=60.0), ptz, lambda *a: {})
+    hunter._last_command = 1000.0
+    assert not hunter._keepalive_step(1030.0)  # a command 30 s ago: not idle yet
+    hunter._quiet_until = 1070.0
+    assert not hunter._keepalive_step(1065.0)  # idle, but the camera is refocusing after a zoom
+    with hunter._ptz_lock:
+        assert not hunter._keepalive_step(1080.0)  # a move holds the PTZ
+    assert hunter._keepalive_step(1080.0) and ptz.commands[-1][1] == "continuous" and ptz.speed == (0.0, 0.0, 0.0)
+    assert not hunter._keepalive_step(1100.0)  # just sent one
+
+
+def test_views_blocked_by_an_old_avoid_veto_are_scored_again(tmp_path):
+    memory = tmp_path / "hunter.json"
+    stuck = {"prior": 0.02, "avoid": 0.98, "visits": 3, "hits": {}, "checks": {}, "last_visit": 1.0, "last_yes": 0.0,
+             "scored": True, "base_avoid": 0.98, "extra_avoid": {}}
+    wall = {**stuck, "extra_avoid": {"is this siding of a house?": 0.95}}  # vetoed by today's rules: stays blocked
+    memory.write_text(json.dumps({"version": 2, "home": None, "views": [
+        {"pan": 190.0, "tilt": -10.0, "fov": 37.0, "stats": stuck}, {"pan": 72.0, "tilt": -10.0, "fov": 37.0, "stats": wall}]}))
+    hunter = Hunter(HunterConfig("cam"), FakePtz(), lambda *a: {}, memory=memory)
+    hunter._load()
+    lawn, house = hunter.stats[View(190.0, -10.0, 37.0)], hunter.stats[View(72.0, -10.0, 37.0)]
+    assert not lawn.scored and lawn.avoid == 0.0 and lawn.prior == 0.5  # neutral, so it gets visited and rescored
+    assert house.scored and house.avoid == 0.98
+
+
+def test_near_duplicate_views_are_merged_with_their_history():
+    a, b, c = View(194.5, -16.0, 37.0), View(190.5, -13.5, 37.0), View(249.0, -30.0, 37.0)  # a and b: 6.5 degrees apart
+    stats = {a: ViewStats(prior=0.3, visits=50, looks={10: 40}, seen={10: 9.0}, hits={10: 2}),
+             b: ViewStats(prior=0.5, visits=20, looks={10: 20, 11: 3}, seen={10: 1.0}),
+             c: ViewStats(prior=0.6, visits=5)}
+    merged = merge_duplicates(stats)
+    assert set(merged) == {a, c} and same_spot(a, b) and not same_spot(a, View(194.5, -16.0, 18.5))
+    assert merged[a].visits == 70 and merged[a].looks == {10: 60, 11: 3} and merged[a].seen[10] == 10.0
+    assert merged[a].prior == 0.3  # the most visited copy keeps its scores
+
+
+def test_a_move_that_ends_a_little_off_counts_as_the_view_it_was_for():
+    ptz = FakePtz(View(184.0, -12.0, 37.0), lag=1.0)
+    hunter = Hunter(HunterConfig("cam", rest_s=0.0, settle_s=1.0), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    target = View(220.0, -10.0, 37.0)
+    hunter.stats[target] = ViewStats()
+    assert hunter._go(target) == target and len(hunter.stats) == 1
+
+
+def test_avoid_answers_lower_a_view_even_below_the_veto():
+    here = View(100.0, -10.0, 37.0)
+    cleaner, branches = View(190.0, -10.0, 37.0), View(194.0, -20.0, 37.0)
+    stats = {here: ViewStats(prior=0.1, visits=9, last_visit=999.0),
+             cleaner: ViewStats(prior=0.6, visits=3, last_visit=500.0, avoid=0.05),
+             branches: ViewStats(prior=0.6, visits=3, last_visit=500.0, avoid=0.5)}
+    assert choose_next(stats, here, now=1000.0, hour=9) == cleaner
+
+
+def test_boredom_moves_the_hunter_on_from_an_area_it_has_been_watching():
+    lawn_a, lawn_b, playground = View(186.0, -12.0, 37.0), View(194.0, -16.0, 37.0), View(249.0, -30.0, 37.0)
+    stats = {lawn_a: ViewStats(prior=0.6, visits=40, last_visit=900.0), lawn_b: ViewStats(prior=0.6, visits=40, last_visit=900.0),
+             playground: ViewStats(prior=0.55, visits=40, last_visit=900.0)}
+    kw = dict(now=1000.0, hour=9, exploration=0.0)
+    assert choose_next(stats, lawn_a, **kw) == lawn_b  # not bored yet: the nearby equally good view
+    recent = [(1000.0 - 25 * i, lawn_a if i % 2 else lawn_b) for i in range(12)]  # five minutes around the lawn
+    assert choose_next(stats, lawn_a, recent=recent, **kw) == playground
+
+
+
+def test_a_hot_spot_near_home_loses_to_a_fresh_area_once_watched_again_and_again():
+    hot, far = View(175.0, -10.0, 37.0), View(101.5, -10.0, 37.0)
+    stats = {hot: ViewStats(prior=0.5, visits=40, last_visit=0.0, hits={10: 3}, looks={10: 40}, seen={10: 6.0}),
+             far: ViewStats(prior=0.5, visits=40, last_visit=900.0, looks={10: 40}, seen={10: 4.0})}
+    kw = dict(now=1000.0, hour=10, exploration=0.0, magnets=[View(184.0, -12.0, 37.0)], since_magnet_s=600.0)
+    between = View(130.0, -10.0, 37.0)
+    assert choose_next(stats, between, **kw) == hot  # finds there and the home magnet pull it back
+    recent = [(1000.0 - 60 * i, hot) for i in range(4)]  # watched four times in the last few minutes
+    assert choose_next(stats, between, recent=recent, **kw) == far
+
+
+
+def test_boredom_never_sends_the_hunter_to_a_wall():
+    lawn, house_side = View(175.0, -10.0, 37.0), View(131.0, -10.0, 37.0)
+    stats = {lawn: ViewStats(prior=0.4, visits=40, last_visit=990.0, hits={10: 3}, looks={10: 40}, seen={10: 4.0},
+                             scored=True, scene=0.43, base_avoid=0.43, avoid=0.43),
+             house_side: ViewStats(prior=0.04, visits=2, last_visit=0.0, scored=True, scene=0.09, base_avoid=0.68,
+                                   avoid=0.68)}
+    recent = [(1000.0 - 30 * i, lawn) for i in range(20)]  # the lawn has been watched for ten minutes
+    assert hopeless(stats[house_side]) and not hopeless(stats[lawn])
+    assert choose_next(stats, lawn, now=1000.0, hour=10, recent=recent) == lawn
+
+def test_a_bored_area_still_beats_a_quiet_view():
+    lawn, quiet_home = View(175.0, -10.0, 37.0), View(186.0, -12.0, 37.0)
+    stats = {quiet_home: ViewStats(prior=0.5, visits=500, last_visit=990.0, looks={10: 500}),
+             lawn: ViewStats(prior=0.5, visits=40, last_visit=900.0, hits={10: 20}, looks={10: 40}, seen={10: 20.0})}
+    recent = [(1000.0 - 20 * i, lawn) for i in range(10)]
+    assert choose_next(stats, lawn, now=1000.0, hour=10, recent=recent) == lawn  # quiet stays skipped
+
+def test_someone_else_moving_the_camera_hands_it_over_and_silences_the_hunter():
+    ptz = FakePtz(View(190.0, -10.0, 37.0))
+    hunter = Hunter(HunterConfig("cam", handback_s=180.0, keepalive_s=60.0), ptz, lambda *a: {})
+    hunter._expected = View(190.0, -10.0, 37.0)
+    hunter._last_command = 0.0
+    assert not hunter._watch(1000.0)  # still where the hunter left it
+    ptz.pan = 230.0  # an operator panned it (or the camera's auto-tracking followed someone)
+    assert hunter._watch(1001.0) and hunter._handed_over_until == 1181.0
+    assert not hunter._keepalive_step(1100.0)  # no stop command may interrupt them
+    ptz.pan = 240.0
+    assert hunter._watch(1150.0) and hunter._handed_over_until == 1330.0  # still moving: hand-back moves on
+    assert not hunter._watch(1400.0)  # still since: the hunter takes over again
+
+
+
+def test_settings_saved_while_handed_over_neither_stop_the_operator_nor_restart_the_hunt():
+    ptz = FakePtz(View(190.0, -10.0, 37.0))
+    old = Hunter(HunterConfig("cam"), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    old._handed_over(ptz.now, View(230.0, -10.0, 37.0))
+    ptz.speed, sent = (0.3, 0.0, 0.0), len(ptz.commands)  # the operator is panning
+    old.stop(wait=False, return_home=False)
+    assert len(ptz.commands) == sent  # no stop on top of their move
+    new = Hunter(HunterConfig("cam", wide_share=1.0), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    new.take_over_from(old)
+    assert new._handed_over_until == old._handed_over_until and new._expected == View(230.0, -10.0, 37.0)
+
+
+def test_a_false_hand_over_that_left_the_hunters_own_move_running_is_caught_and_stopped():
+    # 11:31 on Back PTZ: a false hand-over mid-move left the hunter's pan-and-tilt command running (it never stops
+    # someone else's move); tilt hit its end stop and the camera panned in circles for 15 minutes, every move
+    # extending the hand-over.
+    ptz = FakePtz(View(246.7, -42.7, 36.9), tilt_max=5.0)
+    hunter = Hunter(HunterConfig("cam", handback_s=10.0), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    ptz.speed = (-0.2, 0.2, 0.0)  # the hunter's command, still in force
+    hunter._handed_over(ptz.now, ptz.position(), {"pan": -0.2, "tilt": 0.2})
+    for _ in range(4):
+        ptz.sleep(2.0)
+        hunter._watch(ptz.now)
+    assert ptz.speed == (0.0, 0.0, 0.0) and ptz.now >= hunter._handed_over_until  # stopped, and the hunter carries on
+
+
+
+def test_a_runaway_slowed_by_the_zoom_is_still_recognised_as_the_hunters():
+    # 12:00 on Back PTZ: zoomed in to 17 degrees, speed 0.2 panned about 2 degrees a second, not 6.
+    ptz = FakePtz(View(205.5, -16.8, 17.0))
+    hunter = Hunter(HunterConfig("cam", handback_s=10.0), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    hunter._handed_over(ptz.now, ptz.position(), {"pan": 0.2, "tilt": -0.02})
+    ptz.speed = (0.07, -0.007, 0.0)  # the same command, slowed by the zoom
+    for _ in range(4):
+        ptz.sleep(2.0)
+        hunter._watch(ptz.now)
+    assert ptz.speed == (0.0, 0.0, 0.0)
+
+
+def test_a_camera_that_keeps_moving_one_way_for_a_minute_while_handed_over_is_stopped():
+    ptz = FakePtz(View(200.0, -10.0, 36.9))
+    hunter = Hunter(HunterConfig("cam", handback_s=10.0), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    hunter._handed_over(ptz.now, ptz.position())  # no command of the hunter's known to be running
+    ptz.speed = (0.05, 0.0, 0.0)
+    for _ in range(20):
+        ptz.sleep(2.0)
+        hunter._watch(ptz.now)
+    assert ptz.speed != (0.0, 0.0, 0.0)  # 40 s: could still be someone's
+    for _ in range(12):
+        ptz.sleep(2.0)
+        hunter._watch(ptz.now)
+    assert ptz.speed == (0.0, 0.0, 0.0)
+
+def test_a_real_operator_after_a_hand_over_is_left_alone():
+    ptz = FakePtz(View(246.7, -20.0, 36.9))
+    hunter = Hunter(HunterConfig("cam", handback_s=10.0), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    hunter._handed_over(ptz.now, ptz.position(), {"pan": -0.2, "tilt": 0.2})
+    ptz.speed = (0.4, 0.0, 0.0)  # their joystick replaced the hunter's command
+    sent = len(ptz.commands)
+    for _ in range(4):
+        ptz.sleep(2.0)
+        hunter._watch(ptz.now)
+    assert len(ptz.commands) == sent and ptz.now < hunter._handed_over_until
+
+
+def test_a_zoom_still_settling_during_a_pan_is_not_an_operator():
+    ptz = FakePtz(View(200.0, -10.0, 28.6))
+    real_sleep = ptz.sleep
+
+    def sleep(seconds):
+        real_sleep(seconds)
+        if ptz.fov < 36.9:
+            ptz.fov = min(36.9, ptz.fov + 3.0 * seconds)  # the zoom-out finishing while the hunter pans
+    ptz.sleep = sleep
+    where = move_slowly(ptz, View(230.0, -10.0, 36.9), max_speed=0.2, sleep=ptz.sleep)
+    assert abs(where.pan - 230.0) <= 2.5 and ptz.speed == (0.0, 0.0, 0.0)
+
+
+
+def test_a_look_at_a_view_learned_a_few_degrees_off_is_not_a_hand_over():
+    ptz = FakePtz(View(238.2, -22.7, 18.8))
+    hunter = Hunter(HunterConfig("cam"), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    hunter._expected = ptz.position()  # where the move ended
+    assert hunter._still_at(View(242.0, -24.0, 18.8))  # the known view at that spot, 4 degrees away
+    ptz.pan = 250.0
+    assert not hunter._still_at(View(242.0, -24.0, 18.8)) and hunter._handed_over_until > ptz.now
+
+
+def test_after_a_zoom_the_hunter_waits_for_the_zoom_to_read_back_before_watching():
+    class LateZoom(FakePtz):  # 11:54:57: the zoom-out still read 15.7 degrees after the focus pause
+        def absolute(self, view):
+            seen, at = self._seen, self._seen_at
+            super().absolute(view)
+            self._seen, self._seen_at = seen, at  # the readback does not refresh at once
+    ptz = LateZoom(View(185.8, -13.7, 15.7), lag=3.0)
+    ptz.position()
+    hunter = Hunter(HunterConfig("cam", settle_s=0.0, focus_s=0.0), ptz, lambda *a: {}, sleep=ptz.sleep,
+                    clock=lambda: ptz.now)
+    hunter.home = View(185.8, -13.7, 36.9)
+    hunter._go(View(185.8, -13.7, 36.9))
+    assert abs(hunter._expected.fov - 36.9) < 0.5  # where the zoom settled, not the late reading
+    assert not hunter._watch(ptz.now)
+
+def test_obeys_tells_the_hunters_command_from_someone_elses():
+    a = View(200.0, -10.0, 36.9)
+    assert obeys({"pan": 0.2}, a, View(212.0, -10.0, 36.9), 2.0)  # 6 degrees a second, as commanded
+    assert obeys({"pan": -0.2, "tilt": 0.2}, View(200.0, 5.0, 36.9), View(188.0, 5.0, 36.9), 2.0)  # tilt at its stop
+    assert obeys({"pan": 0.2}, a, View(188.0, -10.0, 36.9), 2.0) is False  # the other way
+    assert obeys({"pan": 0.2}, a, View(200.0, -10.0, 36.9), 2.0) is None  # standing still
+
+def test_a_move_meeting_someone_elses_control_stops_without_sending_a_stop():
+    ptz = FakePtz(View(190.0, -10.0, 37.0))
+    real_sleep = ptz.sleep
+
+    def sleep(seconds):
+        real_sleep(seconds)
+        if ptz.now > 1.0:
+            ptz.pan -= 2.0  # someone else panning while the hunter only tilts
+    ptz.sleep = sleep
+    with pytest.raises(ExternalControl):
+        move_slowly(ptz, View(190.0, -20.0, 37.0), max_speed=0.2, sleep=ptz.sleep)
+    assert ptz.speed != (0.0, 0.0, 0.0)  # the hunter's last command was not a stop on top of theirs
+
+
+def test_the_hunter_waits_while_handed_over_then_carries_on_from_where_it_was_left():
+    ptz = FakePtz()
+    hunter = Hunter(HunterConfig("cam"), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    hunter._handed_over_until = 60.0
+    sent = len(ptz.commands)
+    assert hunter._wait_while_handed_over() and ptz.now >= 60.0
+    assert len(ptz.commands) == sent and hunter.status.view is None and hunter._expected is not None
+
+
+
+def test_the_boredom_cycle_pauses_while_handed_over():
+    ptz = FakePtz()
+    hunter = Hunter(HunterConfig("cam"), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    hunter._mode, hunter._mode_until = "looking around", ptz.now + 50.0
+    hunter._handed_over_until = ptz.now + 180.0
+    assert hunter._wait_while_handed_over()
+    assert hunter._mode == "looking around" and hunter._mode_until - ptz.now >= 49.0  # its close-up time is kept
+
+def test_the_survey_skips_spots_already_known_under_a_merged_view():
+    ptz = FakePtz(View(186.0, -12.0, 37.0))
+    asked = []
+
+    def ask(camera_id, jpeg, questions):
+        asked.append(1)
+        hunter.stop(wait=False)
+        return {q: {"true": 0.1} for q in questions if q != "_kind"} | {"_kind": kind(ground=1.0)}
+
+    cfg = HunterConfig("cam", pan_min=190, pan_max=190.5, tilts=[-10.0], rest_s=0, settle_s=0, tiles=1)
+    hunter = Hunter(cfg, ptz, ask, sleep=ptz.sleep, clock=lambda: ptz.now)
+    hunter.stats[View(186.0, -12.0, 37.0)] = ViewStats(prior=0.5, visits=40, scored=True)
+    hunter.home = View(186.0, -12.0, 37.0)
+    hunter.run()
+    assert View.of(190.0, -10.0, 37.0) not in hunter.stats  # 190/-10 is 186/-12's spot: not surveyed again
+
+
+class FakeEmbedder:
+    """Stands in for the embedding server: a fixed good-place share per snapshot, and per-tile shares and cue
+    similarities for tile scans. ``down`` makes every call fail, as when the server is not running."""
+
+    def __init__(self, share=0.5, tile_shares=None, tile_sims=None, down=False):
+        self.share_value, self.tile_shares, self.tile_sims, self.down = share, tile_shares, tile_sims, down
+        self.calls = []
+
+    def look(self, jpeg, boxes, thumb=320):
+        self.calls.append("look")
+        if self.down:
+            raise ConnectionError("embedding server down")
+        return [1.0, 0.0], [[0.0, 1.0] for _ in boxes], b"thumb"
+
+    def share(self, vector):
+        return self.share_value
+
+    def tile_scores(self, vectors, cues):
+        return self.tile_shares, self.tile_sims
+
+
+def _looking_hunter(embedder, asked):
+    ptz = FakePtz(View(131.0, -10.0, 36.9))
+
+    def ask(camera_id, jpeg, questions):
+        asked.append(sorted(questions) if not isinstance(jpeg, list) else ["tiles"])
+        return {q: {"true": 0.9 if q == "_ground" else 0.02} for q in questions if q != "_kind"} | {"_kind": kind(ground=1.0)}
+
+    hunter = Hunter(HunterConfig("cam", cues=["Is there a path or walkway?"]), ptz, ask, crop=no_crop,
+                    sleep=ptz.sleep, clock=lambda: ptz.now, embedder=embedder)
+    hunter._expected = ptz.position()
+    return hunter, ptz.position()
+
+
+def test_a_view_the_embedder_rates_hopeless_skips_clefs_scene_questions_and_tiles():
+    asked = []
+    hunter, view = _looking_hunter(FakeEmbedder(share=0.04), asked)  # the side of the house
+    hunter._look(survey=True, view=view)
+    assert asked == [["t0"]]  # only the hunt question: no scene questions, no tiles
+    stats = hunter.stats[view]
+    assert hopeless(stats) and stats.scored and stats.embed == 0.04
+    other = View(190.0, -10.0, 36.9)
+    hunter.stats[other] = ViewStats(prior=0.3)
+    assert choose_next(hunter.stats, view, now=1000.0, hour=10) == other
+
+
+def test_a_promising_view_is_still_scored_by_clef():
+    asked = []
+    hunter, view = _looking_hunter(FakeEmbedder(share=0.6), asked)
+    hunter._look(survey=True, view=view)
+    assert any(q.startswith("_") for q in asked[0]) and ["tiles"] in asked
+    assert hunter.stats[view].embed == 0.6 and not hopeless(hunter.stats[view])
+
+
+def test_with_the_embedder_down_clef_scores_the_view_as_before():
+    asked = []
+    hunter, view = _looking_hunter(FakeEmbedder(down=True), asked)
+    hunter._look(survey=True, view=view)
+    assert any(q.startswith("_") for q in asked[0]) and hunter.stats[view].embed == -1.0
+
+
+def test_the_tile_scan_uses_embeddings_and_skips_hopeless_tiles():
+    sims = [{"Is there a path or walkway?": 0.62} for _ in range(9)]
+    sims[4] = {"Is there a path or walkway?": 0.72}  # a path stands out in the middle tile
+    sims[0] = {"Is there a path or walkway?": 0.71}  # and in a corner that is mostly the house wall
+    shares = [0.5] * 9
+    shares[0] = 0.03
+    asked = []
+    hunter, view = _looking_hunter(FakeEmbedder(tile_shares=shares, tile_sims=sims), asked)
+    hunter.home = view
+    hunter.stats[view] = ViewStats(prior=0.6, scored=True, scene=0.6, cue_scan_at=-1e9)  # due for a scan
+    hunter._scan_tiles(view, b"jpeg")
+    children = [(v, s) for v, s in hunter.stats.items() if v.fov < view.fov]
+    assert asked == [] and len(children) == 1  # no Clef request; the wall corner did not become a view
+    child, stats = children[0]
+    assert stats.found_by == "Is there a path or walkway?" and stats.embed == 0.5
+
+
+def test_good_share_and_standout_tiles():
+    from clef_operator.embed import good_share, standout_tiles
+    good, bad = [[1.0, 0.0]], [[0.0, 1.0]]
+    assert good_share([0.9, 0.1], good, bad) > 0.99 and good_share([0.1, 0.9], good, bad) < 0.01
+    tiles = [{"path": 0.62}] * 4 + [{"path": 0.73}] + [{"path": 0.63}] * 4
+    ((index, score, cue),) = standout_tiles(tiles)
+    assert index == 4 and cue == "path" and score == pytest.approx(1.0)

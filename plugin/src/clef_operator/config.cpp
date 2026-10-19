@@ -198,7 +198,6 @@ std::string engineSettingsModel()
             spinBox("closeAfter", "Windows below before an event closes", 1, 1, 10),
             comboBox("maxFps", "Maximum fps for any question", "10",
                 {{"1", "1"}, {"2", "2"}, {"4", "4"}, {"6", "6"}, {"8", "8"}, {"10", "10"}}),
-            checkBox("showAnswers", "Show answers on video (lower right)", true),
         }),
     }}, {"sections", Json::array{
         Json::object{{"type", "Section"}, {"name", "systemQuestions"}, {"caption", "System questions (all cameras)"},
@@ -246,6 +245,7 @@ std::string deviceAgentSettingsModel(const std::vector<std::string>& zoneNames)
             spinBox("hunter.dwellSeconds", "Dwell when found (s)", 60, 10, 1800),
             spinBox("hunter.widePercent", "Time zoomed all the way out (%)", 75, 0, 100),
             spinBox("hunter.focusSeconds", "Focus time after zooming (s)", 4, 0, 30),
+            spinBox("hunter.handBackSeconds", "Take back after an operator or auto-tracking (s)", 10, 5, 3600),
             doubleSpinBox("hunter.panMin", "Pan from (degrees)", 0.0, -1.0, 360.0),
             doubleSpinBox("hunter.panMax", "Pan to (degrees)", 360.0, -1.0, 360.0),
             Json::object{{"type", "TextField"}, {"name", "hunter.status"}, {"caption", "Status"}, {"defaultValue", ""},
@@ -321,7 +321,6 @@ SystemConfig parseSystemConfig(const Settings& s)
     c.windowSeconds = (int) getDouble(s, "windowSeconds", 30);
     c.overlapSeconds = std::min((int) getDouble(s, "overlapSeconds", 10), c.windowSeconds - 5);
     c.onsetWindow = getBool(s, "onsetWindow", true);
-    c.showAnswers = getBool(s, "showAnswers", true);
     c.activeMotionShare = getDouble(s, "activeMotionPercent", 5) / 100.0;
     c.quietSeconds = (int) getDouble(s, "quietSeconds", 60);
     c.onThreshold = getDouble(s, "onThreshold", 0.8);
@@ -396,6 +395,7 @@ CameraConfig parseCameraConfig(const Settings& s, const SystemConfig& system)
     c.hunter.dwellSeconds = (int) getDouble(s, "hunter.dwellSeconds", 60);
     c.hunter.widePercent = (int) getDouble(s, "hunter.widePercent", 75);
     c.hunter.focusSeconds = (int) getDouble(s, "hunter.focusSeconds", 4);
+    c.hunter.handBackSeconds = (int) getDouble(s, "hunter.handBackSeconds", 10);
     c.hunter.panMin = getDouble(s, "hunter.panMin", 0.0);
     c.hunter.panMax = getDouble(s, "hunter.panMax", 360.0);
     if (std::fabs(c.hunter.panMin) <= 1.0 && std::fabs(c.hunter.panMax) <= 1.0 && c.hunter.panMax > c.hunter.panMin)

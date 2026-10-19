@@ -1,9 +1,7 @@
 #pragma once
 
 #include <algorithm>
-#include <cctype>
 #include <cstdint>
-#include <cstdio>
 #include <map>
 #include <optional>
 #include <string>
@@ -11,45 +9,6 @@
 #include "config.h"
 
 namespace clef_operator {
-
-/**
- * Short text for the answers shown on the video: a true/false question shows "YES 0.92" at or above its
- * on-threshold and "no 0.02" below it; choice and scale questions show their most likely option ("closed 0.85"),
- * in capitals when the answer is alerting.
- */
-inline std::string answerText(
-    const QuestionConfig& q, const std::map<std::string, double>& answer, double alertP)
-{
-    char number[16];
-    const bool alert = alertP >= q.onThreshold;
-    if (q.kind == "noul")
-    {
-        std::snprintf(number, sizeof(number), "%.2f", alertP);
-        return std::string(alert ? "YES " : "no ") + number;
-    }
-    std::string best;
-    double bestP = -1;
-    for (const auto& [option, p]: answer)
-    {
-        if (p > bestP)
-            best = option, bestP = p;
-    }
-    if (best.empty())
-        return "-";
-    if (alert)
-        std::transform(best.begin(), best.end(), best.begin(), [](unsigned char c) { return (char) std::toupper(c); });
-    std::snprintf(number, sizeof(number), "%.2f", bestP);
-    return best + " " + number;
-}
-
-/** The label for a question in the answers shown on the video: its text, shortened, after its zone if any. */
-inline std::string answerLabel(const std::string& text, const std::string& zone, size_t maxLength = 40)
-{
-    std::string label = zone.empty() ? text : zone + ": " + text;
-    if (label.size() > maxLength)
-        label = label.substr(0, maxLength - 3) + "...";
-    return label;
-}
 
 /** Alert probability of one answer ({option: probability}), as in clef_operator/events.py. */
 inline double alertProbability(const QuestionConfig& q, const std::map<std::string, double>& answer)

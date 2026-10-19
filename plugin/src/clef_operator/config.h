@@ -57,7 +57,6 @@ struct SystemConfig
     double offThreshold = 0.5;
     int closeAfter = 1;
     double maxFps = 10;
-    bool showAnswers = true; //< the latest answer to each question, small in the lower right of the video
     std::vector<QuestionConfig> questions;
 };
 
@@ -78,6 +77,7 @@ struct HunterSettings
     int dwellSeconds = 60;
     int widePercent = 75; //< share of the time spent zoomed all the way out; the rest, looking closer at spots
     int focusSeconds = 4; //< after a zoom change, no commands or snapshots while the camera refocuses
+    int handBackSeconds = 10; //< an operator or the camera's auto-tracking moved it: hand back after it is this still
     double panMin = 0.0; //< degrees
     double panMax = 360.0;
 };

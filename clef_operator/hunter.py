@@ -19,9 +19,9 @@ hunter is away from all of them.
 Found: when the frame or a tile answers yes (or a tile comes close), centre on that tile and zoom in, slowly, then
 dwell while the answer stays yes, and raise an Nx generic event.
 
-Moves are slow: continuous mode at a capped speed, axes timed to arrive together, a full stop on arrival, with a rest
-between moves; slower passes close the gap, and a small absolute move (a short hop: real cameras ignore the speed of
-absolute moves) corrects the last few degrees. An axis that stops moving while driven is at its end stop (on Back PTZ,
+Pan and tilt are always slow: continuous mode at a capped speed, axes timed to arrive together, a full stop on arrival,
+a rest between moves, and slower passes for the last few degrees (to within 2). Absolute moves ignore their speed and are
+loud, so they are used only for zoom, which is silent. An axis that stops moving while driven is at its end stop (on Back PTZ,
 tilting up into the end stop makes the camera pan by itself). Views are recorded where the camera actually ended up.
 """
 
@@ -33,11 +33,13 @@ import subprocess
 import tempfile
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Protocol
 
+from . import embed as embedding
 from .clef import choice, noul
 
 Answers = dict[str, dict[str, float]]
@@ -51,7 +53,7 @@ PAN_RATE, TILT_RATE, FOV_RATE = 30.0, 17.5, 48.0
 PAN_TOL, TILT_TOL, FOV_TOL = 0.6, 0.6, 1.0
 READBACK_LAG_S = 0.5  # the Server's position is refreshed about once a second: stop this much travel early
 STALL_S = 2.5  # a driven axis whose position has not changed for this long is at its end stop
-MEMORY_VERSION = 2  # views scored by older prompts (or at positions never reached) are forgotten on load
+MEMORY_VERSION = 3  # older than 2: forgotten on load (other prompts, or positions never reached); 2: see _load
 
 
 def angle_delta(a: float, b: float) -> float:
@@ -85,6 +87,12 @@ class HunterConfig:
     dwell_s: float = 60.0
     focus_s: float = 4.0  # after a zoom change, no commands or snapshots for this long: the camera refocuses
     wide_share: float = 0.75  # share of the time spent zoomed all the way out; the rest, looking closer at spots
+    cycle_s: float = 240.0  # boredom cycle: wide_share of it watching wide views, then it looks around close up
+    bored_weight: float = 0.6  # how much recently watched areas (not just views) count against going back there
+    handback_s: float = 10.0  # someone else moved the camera (an operator, the camera's own auto-tracking): hand it
+    #                            over, and take it back only after it has been still this long
+    keepalive_s: float = 60.0  # while still, a stop command this often: the Server sends an idle PTZ to its home
+    #                            position at full speed (loud), so it must never look idle while the hunter runs
     hold_s: float = 52.0  # while the camera's own windows are arriving, stay this long (one full 30 s window, its
     #                       20 s step and the settle) unless a clean window was answered sooner
     max_dwell_s: float = 600.0  # then move on even if the answer is still yes
@@ -125,6 +133,7 @@ QUIET_LOOKS = 12
 QUIET_SHARE = 0.25  # and only once the target has been seen somewhere (SIGHTINGS): "rare compared with where it shows
 SIGHTINGS = 1.0  # up", not tiny differences in Clef's noise while nothing shows up anywhere
 QUIET_RECHECK_S = 3 * 3600.0
+HOPELESS_BLOCKED, HOPELESS_AVOID, HOPELESS_SCENE = 0.5, 0.7, 0.15  # see ``hopeless``
 
 
 @dataclass
@@ -145,6 +154,7 @@ class ViewStats:
     found_by: str = ""  # for a zoomed view: the helper question its tile stood out for
     base_avoid: float = 0.0  # the built-in blockers alone (``avoid`` adds the operator's, weighed per camera)
     extra_avoid: dict[str, float] = field(default_factory=dict)  # operator's avoid question -> P(yes)
+    embed: float = -1.0  # EmbeddingGemma's good-place share of the view (-1: not embedded; see embed.py)
 
     def hit_rate(self, hour: int) -> float:
         return (self.hits.get(hour, 0) + 0.5) / (self.checks.get(hour, 0) + 2.0)
@@ -176,7 +186,7 @@ class ViewStats:
                 "checks": self.checks, "last_visit": self.last_visit, "last_yes": self.last_yes, "scored": self.scored,
                 "looks": self.looks, "seen": self.seen, "scene": self.scene, "cues": self.cues,
                 "cue_scan_at": self.cue_scan_at, "found_by": self.found_by, "base_avoid": self.base_avoid,
-                "extra_avoid": self.extra_avoid}
+                "extra_avoid": self.extra_avoid, "embed": self.embed}
 
     @staticmethod
     def from_json(d: dict) -> "ViewStats":
@@ -189,7 +199,7 @@ class ViewStats:
                          {int(k): v for k, v in d.get("looks", {}).items()}, {int(k): v for k, v in d.get("seen", {}).items()},
                          d.get("scene", d["prior"] if d.get("scored") else -1.0), d.get("cues", {}),
                          d.get("cue_scan_at", 0.0), d.get("found_by", ""), d.get("base_avoid", d["avoid"]),
-                         d.get("extra_avoid", {}))
+                         d.get("extra_avoid", {}), d.get("embed", -1.0))
 
 
 # View scoring, checked against 40 hand-labelled Back PTZ views (rank correlation +0.75; the earlier prompts scored
@@ -340,6 +350,22 @@ def sightings(stats: dict) -> float:
     return sum(sum(s.seen.values()) for s in stats.values())
 
 
+def hopeless(s: ViewStats) -> bool:
+    """No chance of a yes here: the scene questions said it is mostly wall, roof or sky (the built-in blockers at
+    ``HOPELESS_BLOCKED`` or more), or little open ground (scene score under ``HOPELESS_SCENE``), or the avoid answers
+    together reach ``HOPELESS_AVOID``, or EmbeddingGemma rates it below ``embed.HOPELESS`` (then Clef's scene
+    questions are not even asked) - and the target has never been found here. The hunter never goes there to hunt
+    (only the survey looks once); a soft avoid penalty alone let boredom push it onto the side of the house once the
+    good views had all been watched."""
+    if s.total_hits:
+        return False
+    if 0.0 <= s.embed < embedding.HOPELESS:  # EmbeddingGemma: far more like a wall, roof, sky or leaves than a yard
+        return True
+    if not s.scored:
+        return False
+    return s.base_avoid >= HOPELESS_BLOCKED or s.avoid >= HOPELESS_AVOID or 0.0 <= s.scene < HOPELESS_SCENE
+
+
 def is_quiet(s: ViewStats, hour: int, best_yield: float, seen_anywhere: float = SIGHTINGS) -> bool:
     return (seen_anywhere >= SIGHTINGS and s.total_looks >= QUIET_LOOKS
             and s.yield_rate(hour) < QUIET_SHARE * best_yield)
@@ -353,40 +379,86 @@ def resting(s: ViewStats, now: float, hour: int, best_yield: float, seen_anywher
 def choose_next(stats: dict[View, ViewStats], current: View | None, now: float, hour: int,
                 travel_weight: float = 0.002, exploration: float = 0.15, magnets: list[View] | None = None,
                 magnet_weight: float = 0.5, magnet_radius: float = 25.0, since_magnet_s: float = 0.0,
-                magnet_return_s: float = 600.0, hot_weight: float = 0.8, hot_revisit_s: float = 300.0) -> View:
+                magnet_return_s: float = 600.0, hot_weight: float = 0.8, hot_revisit_s: float = 300.0,
+                recent: list[tuple[float, View]] | None = None, bored_weight: float = 0.6,
+                bored_half_life_s: float = 600.0, bored_cap: float = 4.0) -> View:
     """Most promising view: learned yield (relative to the best view) and hits, skipping quiet views, plus staleness, exploration, magnet pull and hot-spot pull, minus
     travel (per degree). The magnet pull grows the longer the hunter has been away from every magnet. Hot spots are
     views where the target was found: the more finds, the stronger the pull, and it comes back within minutes of a
     visit (``hot_revisit_s``) instead of the half hour ordinary views take to go stale. Travel costs little (0.2 for
     100 degrees, about 15 s of moving): at 0.01 a degree the best views across the yard were never worth the trip, and
-    the hunter bounced between two neighbouring views for hours."""
+    the hunter bounced between two neighbouring views for hours.
+
+    Avoid answers below the veto (0.8) still count: a view's value is scaled by (1 - avoid). Boredom: each recently
+    watched spot (``recent``: (time, view)) counts against views around it (within about half a field of view),
+    fading with ``bored_half_life_s``, so the hunter moves on to other good areas instead of circling one. Each visit
+    scales a view's appeal by (1 - ``bored_weight``), up to ``bored_cap`` visits' worth. Subtracted and capped at one
+    visit, boredom never outweighed a hot spot's pull plus the home magnet's (the hunter circled its home area); and
+    subtracted at all, it pushed the hunter onto walls once the good views were all bored. Scaled, a view with no
+    promise never wins, and hopeless views (``hopeless``) are never chosen."""
     most_hits = max([s.total_hits for s in stats.values()] + [1])
     total_visits = sum(s.visits for s in stats.values()) + 1
     pull_strength = magnet_weight * (0.1 + min(1.0, since_magnet_s / magnet_return_s)) if magnets else 0.0
-    best_yield = max([s.yield_rate(hour) for s in stats.values() if s.avoid < 0.8] + [1e-9])
+    best_yield = max([s.yield_rate(hour) for s in stats.values() if s.avoid < 0.8 and not hopeless(s)] + [1e-9])
     seen_anywhere = sightings(stats)
 
     def score(view: View) -> float:
         s = stats[view]
-        if s.avoid >= 0.8:
-            return -1.0
-        value = s.yield_rate(hour) / best_yield  # relative to the best view now, so it stays 0..1 as yields fall
+        if s.avoid >= 0.8 or hopeless(s):
+            return -2000.0
+        value = s.yield_rate(hour) / best_yield * (1.0 - s.avoid)  # relative to the best view; avoid answers count
         if resting(s, now, hour, best_yield, seen_anywhere):
-            return -0.5
+            return -1000.0  # below any active view, however bored (all tied at -0.5, quiet home won every tie)
         stale = min(1.0, (now - s.last_visit) / 1800.0) if s.last_visit else 1.0
         # Curiosity in proportion to promise: an unvisited wall is not worth a look just for being unvisited.
         explore = exploration * value * math.sqrt(math.log(total_visits) / (s.visits + 1))
         travel = travel_weight * (view.distance(current) if current else 0.0)
         repeat = 0.5 if current and view.distance(current) <= 3.0 else 0.0  # near copies count as staying put
-        pull = pull_strength * magnet_pull(view, magnets or [], magnet_radius)
+        pull = pull_strength * magnet_pull(view, magnets or [], magnet_radius) * (1.0 - s.avoid)  # home's area, not its wall
         hot = 0.0
         if s.total_hits:
             fame = math.log1p(s.total_hits) / math.log1p(most_hits)
             due = min(1.0, (now - s.last_visit) / hot_revisit_s) if s.last_visit else 1.0
             hot = hot_weight * fame * due
-        return value * (0.5 + 0.5 * stale) + explore + pull + hot - travel - repeat
+        bored = min(bored_cap, sum(
+            0.5 ** ((now - t) / bored_half_life_s) * math.exp(-(view.distance(v) / (0.5 * max(view.fov, v.fov))) ** 2)
+            for t, v in (recent or ())))
+        appeal = value * (0.5 + 0.5 * stale) + explore + pull + hot
+        return appeal * (1.0 - bored_weight) ** bored - travel - repeat  # bored scales appeal: a hopeless view never wins
 
     return max(stats, key=score)
+
+
+def same_spot(a: View, b: View, share: float = 0.25) -> bool:
+    """Close enough to be the same view: within ``share`` of the field of view, at about the same zoom."""
+    return abs(a.fov - b.fov) <= share * max(a.fov, b.fov) and a.distance(b) <= share * max(a.fov, b.fov)
+
+
+def merge_stats(into: ViewStats, other: ViewStats) -> None:
+    """Fold a near-duplicate view's history into another (the more visited one keeps its scores)."""
+    into.visits += other.visits
+    for mine, theirs in ((into.hits, other.hits), (into.checks, other.checks), (into.looks, other.looks)):
+        for hour, n in theirs.items():
+            mine[hour] = mine.get(hour, 0) + n
+    for hour, p in other.seen.items():
+        into.seen[hour] = into.seen.get(hour, 0.0) + p
+    into.last_visit = max(into.last_visit, other.last_visit)
+    into.last_yes = max(into.last_yes, other.last_yes)
+    into.cue_scan_at = max(into.cue_scan_at, other.cue_scan_at)
+    into.found_by = into.found_by or other.found_by
+
+
+def merge_duplicates(stats: dict[View, ViewStats]) -> dict[View, ViewStats]:
+    """One view per spot: near-duplicates (moves that ended a little off, neighbours added twice) merged into the most
+    visited of them, so what is learned about a spot is not spread over a dozen copies."""
+    kept: dict[View, ViewStats] = {}
+    for view, s in sorted(stats.items(), key=lambda vs: -vs[1].visits):
+        twin = next((k for k in kept if same_spot(k, view)), None)
+        if twin is None:
+            kept[view] = s
+        else:
+            merge_stats(kept[twin], s)
+    return kept
 
 
 def tile_boxes(n: int) -> list[tuple[float, float, float, float]]:
@@ -454,6 +526,39 @@ def _left(now: View, target: View) -> dict[str, float]:
     return {"pan": angle_delta(now.pan, target.pan), "tilt": target.tilt - now.tilt, "fov": target.fov - now.fov}
 
 
+class ExternalControl(Exception):
+    """Something other than the hunter is moving the camera (an operator in Nx, or the camera's own auto-tracking)."""
+
+    def __init__(self, where: View, unstopped: dict[str, float] | None = None, why: str = "") -> None:
+        super().__init__(f"camera moved by someone else to pan {where.pan:.1f} tilt {where.tilt:.1f}")
+        self.where, self.why = where, why
+        self.unstopped = unstopped or {}  # the hunter's own command, left running so as not to stop theirs
+
+
+def obeys(speeds: dict[str, float], before: View, after: View, seconds: float) -> bool | None:
+    """Is the camera moving the way the hunter's continuous command ``speeds`` drives it (so the command is still in
+    force, and nobody else's replaced it)? True if every driven pan/tilt axis moves in the commanded direction at
+    10-160% of the commanded rate (Back PTZ slows pan and tilt as it zooms in: at 17 degrees of field of view, speed
+    0.2 pans about 2 degrees a second, not 6; an axis held at an end stop may stand still, but not all of them); False
+    if it moves some other way; None if it stands still."""
+    moved = {"pan": angle_delta(before.pan, after.pan) / seconds, "tilt": (after.tilt - before.tilt) / seconds}
+    if all(abs(v) < 0.3 for v in moved.values()):
+        return None
+    following = False
+    for axis in ("pan", "tilt"):
+        expected = speeds.get(axis, 0.0) * RATE[axis]
+        if abs(expected) < 0.3:
+            if abs(moved[axis]) > max(1.0, 0.5 * max(abs(moved[a]) for a in ("pan", "tilt"))):
+                return False  # an axis the hunter does not drive moves by itself (beyond end-stop creep)
+            continue
+        if abs(moved[axis]) < 0.3:
+            continue  # held at an end stop
+        if math.copysign(1.0, moved[axis]) != math.copysign(1.0, expected) or not 0.1 <= abs(moved[axis] / expected) <= 1.6:
+            return False
+        following = True
+    return following
+
+
 def _pass(ptz: Ptz, target: View, max_speed: float, sleep: Callable[[float], None], timeout_s: float) -> set[str]:
     """One drive toward ``target``, axes timed to arrive together, ended by a full stop as soon as any axis is within
     tolerance (allowing for readback lag), passes its target, moves away from it, stalls at an end stop, or the pass
@@ -476,50 +581,67 @@ def _pass(ptz: Ptz, target: View, max_speed: float, sleep: Callable[[float], Non
     last, unchanged = dict(remaining), {axis: 0.0 for axis in remaining}
     ptz.continuous(speeds["pan"], speeds["tilt"], speeds["fov"])
     elapsed, limit = 0.0, min(timeout_s, 1.5 * duration + 5.0)
+    taken_over = False
+    seen: list[tuple[float, View]] = []
     try:
         while elapsed < limit:
             sleep(0.25)
             elapsed += 0.25
-            left = _left(ptz.position(), target)
+            now = ptz.position()
+            seen.append((elapsed, now))
+            left = _left(now, target)
             for axis in driven:
                 unchanged[axis] = unchanged[axis] + 0.25 if abs(left[axis] - last[axis]) < 0.01 else 0.0
                 last[axis] = left[axis]
                 if unchanged[axis] >= STALL_S:
                     stalled.add(axis)
+            # An axis the hunter is not driving moved: someone else has the camera, unless a driven axis has stalled
+            # (tilting into the end stop makes Back PTZ pan by itself).
+            # Confirmed only once the driven axes are seen not to follow the hunter's command (over 1.5 s: the readback
+            # comes about once a second): a zoom readback still settling is not an operator.
+            if any(abs(left[a] - remaining[a]) > (3.0 if a != "fov" else 4.0) for a in ("pan", "tilt", "fov") if a not in driven) \
+                    and not any(unchanged[a] >= 0.25 for a in driven):
+                back = next((v for t, v in reversed(seen) if elapsed - t >= 1.5), None)
+                pan_tilt = {a: speeds[a] for a in ("pan", "tilt") if speeds[a]}
+                pan_or_tilt_moved = any(abs(left[a] - remaining[a]) > 3.0 for a in ("pan", "tilt") if a not in driven)
+                if back is not None and (pan_or_tilt_moved or (pan_tilt and obeys(pan_tilt, back, now, 1.5) is False)):
+                    taken_over = True
+                    moved = ", ".join(f"{a} {left[a] - remaining[a]:+.1f}" for a in ("pan", "tilt", "fov") if a not in driven)
+                    raise ExternalControl(now, {a: speeds[a] for a in driven},
+                                          f"mid-move driving {'+'.join(driven)}: undriven {moved}")
             if stalled or any(abs(left[a]) <= lead[a] or math.copysign(1.0, left[a]) != direction[a]
                               or abs(left[a]) > abs(remaining[a]) + 2.0 for a in driven):
                 break
     finally:
-        ptz.continuous(0.0, 0.0, 0.0)
+        if not taken_over:  # never stop someone else's move: their command already replaced the hunter's
+            ptz.continuous(0.0, 0.0, 0.0)
     return stalled
 
 
+APPROACH_SPEED = 0.06  # within 10 degrees: about 1.5 degrees a second of pan, so a pass overshoots by about one
+CLOSE_ENOUGH = 2.0  # degrees of pan or tilt: no more correcting
+
+
 def move_slowly(ptz: Ptz, target: View, max_speed: float, sleep: Callable[[float], None] = time.sleep,
-                timeout_s: float = 300.0, passes: int = 3, finish_within: float = 10.0) -> View:
-    """Drive toward ``target`` at no more than ``max_speed`` and stop there. Each continuous pass stops a little early
-    (the Server reports positions late); once within ``finish_within`` degrees on every axis (or after the last pass,
-    so a view is never learned where the camera did not get to), an absolute move puts the camera exactly there (a
-    short hop: absolute moves ignore their speed). An axis that stalled at an end stop
-    is left where it is. Returns where the camera really is."""
+                timeout_s: float = 300.0, passes: int = 6, close_enough: float = CLOSE_ENOUGH) -> View:
+    """Drive toward ``target`` at no more than ``max_speed`` and stop within ``close_enough`` degrees. Every move is a
+    slow continuous move, never an absolute one: cameras ignore the speed of absolute moves, and the jump is loud
+    (going back to a preset was audible). Each pass stops a little early (the Server reports positions late); within
+    10 degrees, passes slow to ``APPROACH_SPEED``. An axis that stalled at an end stop is left where it is. Returns
+    where the camera really is (the caller learns each view there)."""
     stuck: set[str] = set()
-    goal = target
     for i in range(passes + 1):
         if i:
             sleep(1.0)  # let the readback catch up before judging the last pass
         now = ptz.position()
         left = _left(now, target)
+        limits = {"pan": close_enough, "tilt": close_enough, "fov": 2 * FOV_TOL}
+        if i == passes or all(abs(left[a]) <= limits[a] or a in stuck for a in left):
+            return now
         goal = View(now.pan if "pan" in stuck else target.pan, now.tilt if "tilt" in stuck else target.tilt,
                     now.fov if "fov" in stuck else target.fov)
-        if all(abs(left[a]) <= TOL[a] or a in stuck for a in left):
-            return now
-        if i == passes or all(abs(left[a]) <= finish_within or a in stuck for a in left):
-            break
-        stuck |= _pass(ptz, goal, max_speed, sleep, timeout_s)
-    try:
-        ptz.absolute(goal)
-    except Exception:  # noqa: BLE001 - a camera without absolute moves stays where the passes left it
-        return ptz.position()
-    sleep(2.0)
+        far = max([abs(left[a]) for a in ("pan", "tilt") if a not in stuck] + [0.0])
+        stuck |= _pass(ptz, goal, max_speed if far > 10.0 else min(max_speed, APPROACH_SPEED), sleep, timeout_s)
     return ptz.position()
 
 
@@ -540,8 +662,12 @@ class Hunter:
                  on_found: Callable[[HunterConfig, View, str, float], None] | None = None,
                  locate_preset: Callable[[str], View | None] | None = None, crop: Crop = crop_jpeg,
                  sleep: Callable[[float], None] = time.sleep, clock: Callable[[], float] = time.time,
-                 memory: Path | None = None) -> None:
+                 memory: Path | None = None, embedder: "embedding.Embedder | None" = None, embed_map=None) -> None:
         self.config, self.ptz, self.ask, self.on_found = config, ptz, ask, on_found
+        self.embedder = embedder  # cheap looks (embed.py); None: Clef does everything
+        self.embed_map = embed_map  # what each direction looked like, searchable with text (embed_map.py)
+        self._look_vectors: tuple[bytes, list[list[float]]] | None = None  # the last look's snapshot, its tile vectors
+        self._requested: View | None = None  # "look there", from the dashboard's search
         self.locate_preset, self.crop, self.memory = locate_preset, crop, memory
         self.sleep, self.clock = sleep, clock
         self.stats: dict[View, ViewStats] = {}
@@ -570,6 +696,15 @@ class Hunter:
         self._last_look_p = 0.0
         self._last_jpeg = b""
         self.time_wide = self.time_zoomed = 0.0  # recent seconds at wide and at zoomed views (decaying)
+        self._ptz_lock = threading.Lock()  # moves and keep-alive commands never overlap
+        self._last_command = time.time()
+        self._quiet_until = 0.0  # no commands before this (the camera is refocusing)
+        self._expected: View | None = None  # where the hunter left the camera; elsewhere = someone else moved it
+        self._runaway: tuple[float, View, dict[str, float], int] | None = None  # see _still_ours
+        self._steady: tuple[float, tuple[float, float]] | None = None  # see _steady_too_long
+        self._handed_over_until = 0.0  # someone else has the camera until then (extended while it keeps moving)
+        self.recent: deque = deque(maxlen=60)  # (time, view) watched, for boredom
+        self._mode, self._mode_until = "wide", None  # boredom cycle: "wide" watching, or "looking around" close up
         self._stop = threading.Event()
         self._return_home = True
         self._thread: threading.Thread | None = None
@@ -578,19 +713,141 @@ class Hunter:
     def start(self) -> None:
         self._thread = threading.Thread(target=self.run, daemon=True, name=f"hunter-{self.config.camera_id[:8]}")
         self._thread.start()
+        threading.Thread(target=self._keepalive, daemon=True, name=f"hunter-keepalive-{self.config.camera_id[:8]}").start()
+
+    def _keepalive(self) -> None:
+        """Every 2 s while the camera is still: notice if someone else moved it (then hand it over), and every
+        ``keepalive_s`` send a stop command, so the Server never sees an idle PTZ and swings it home at full speed."""
+        while not self._stop.wait(2.0):
+            now = time.time()
+            if not self._watch(now):
+                self._keepalive_step(now)
+
+    def _watch(self, now: float) -> bool:
+        """True if someone else is (or was lately) moving the camera. Not checked during the hunter's own moves or
+        while it refocuses."""
+        if now < self._quiet_until or self._expected is None:
+            return now < self._handed_over_until
+        if not self._ptz_lock.acquire(blocking=False):  # the hunter is moving it
+            return now < self._handed_over_until
+        try:
+            where = self.ptz.position()
+        except Exception:  # noqa: BLE001 - the hunter's own loop reports Server trouble
+            return now < self._handed_over_until
+        finally:
+            self._ptz_lock.release()
+        if self._runaway and self._still_ours(now, where):
+            return False
+        if now < self._handed_over_until and self._steady_too_long(now, where):
+            return False
+        if abs(angle_delta(where.pan, self._expected.pan)) > 2.5 or abs(where.tilt - self._expected.tilt) > 2.5 \
+                or abs(where.fov - self._expected.fov) > max(2.0, 0.1 * self._expected.fov):
+            self._handed_over(now, where, why=f"watcher: expected pan {self._expected.pan:.1f} tilt "
+                                              f"{self._expected.tilt:.1f} fov {self._expected.fov:.1f}")
+        return now < self._handed_over_until
+
+    def _steady_too_long(self, now: float, where: View, limit_s: float = 60.0) -> bool:
+        """Last resort while handed over: a camera that has kept moving the same way for ``limit_s`` is a command left
+        running (a joystick or an auto-tracker does not drive one way for a minute): stop it. True if it did."""
+        last = self._expected
+        dpan, dtilt = angle_delta(last.pan, where.pan), where.tilt - last.tilt
+        if abs(dpan) < 1.0 and abs(dtilt) < 1.0:
+            self._steady = None
+            return False
+        way = (math.copysign(1.0, dpan) if abs(dpan) >= 1.0 else 0.0, math.copysign(1.0, dtilt) if abs(dtilt) >= 1.0 else 0.0)
+        if self._steady is None or self._steady[1] != way:
+            self._steady = (now, way)
+            return False
+        if now - self._steady[0] < limit_s:
+            return False
+        self._steady = None
+        with self._ptz_lock:
+            self.ptz.continuous(0.0, 0.0, 0.0)
+            self._last_command = now
+        print(f"{time.strftime('%H:%M:%S')} hunter {self.config.camera_id[:8]} stopped the camera: it kept moving the "
+              f"same way for {limit_s:.0f} s while handed over (pan {where.pan:.1f} tilt {where.tilt:.1f})", flush=True)
+        self._runaway, self._handed_over_until, self._expected = None, now, None
+        self.status.error = self.warning
+        return True
+
+    def _still_ours(self, now: float, where: View) -> bool:
+        """After a hand-over that left the hunter's command running: if the camera keeps moving exactly as that
+        command drives it (two checks running), nobody replaced it and the hand-over was a false alarm: stop the motor
+        and carry on. Without this, a false alarm (a zoom readback still settling, say) left Back PTZ panning in
+        circles at the tilt end stop for 15 minutes, each move extending the hand-over. True if it stopped the motor."""
+        since, before, speeds, matches = self._runaway
+        if now - since < 1.0:
+            return False
+        verdict = obeys(speeds, before, where, now - since)
+        if not verdict:  # still, or moving some other way: whoever moved it has it
+            self._runaway = None
+            return False
+        if matches + 1 < 2:
+            self._runaway = (now, where, speeds, matches + 1)
+            return False
+        self._runaway = None
+        with self._ptz_lock:
+            self.ptz.continuous(0.0, 0.0, 0.0)
+            self._last_command = now
+        print(f"{time.strftime('%H:%M:%S')} hunter {self.config.camera_id[:8]} stopped its own move: the camera kept "
+              f"going as the hunter drove it, so nobody had taken over (pan {where.pan:.1f} tilt {where.tilt:.1f})",
+              flush=True)
+        self._handed_over_until, self._expected = now, None
+        self.status.error = self.warning
+        return True
+
+    def _handed_over(self, now: float, where: View, unstopped: dict[str, float] | None = None, why: str = "") -> None:
+        """Someone else is moving the camera: an operator, or the camera's own auto-tracking. They come first.
+        ``unstopped``: the hunter's own command, which it did not stop (it never stops someone else's move); the
+        watcher checks that it really was replaced (``_runaway``)."""
+        if unstopped:
+            self._runaway = (now, where, unstopped, 0)
+        if now >= self._handed_over_until:  # a new hand-over, not one extended by further movement
+            print(f"{time.strftime('%H:%M:%S')} hunter {self.config.camera_id[:8]} handed over: moved by someone else to "
+                  f"pan {where.pan:.1f} tilt {where.tilt:.1f} fov {where.fov:.1f}{f' ({why})' if why else ''}", flush=True)
+        self._handed_over_until = now + self.config.handback_s
+        self._expected = where  # further movement extends the hand-over
+        self.status.view = None
+        log_line = f"handed over: camera moved by someone else to pan {where.pan:.1f} tilt {where.tilt:.1f}"
+        if self.status.error != log_line:
+            self.status.error = log_line
+
+    def _keepalive_step(self, now: float) -> bool:
+        """One check; True if a stop command was sent."""
+        if now - self._last_command < self.config.keepalive_s or now < self._quiet_until or now < self._handed_over_until:
+            return False
+        if not self._ptz_lock.acquire(blocking=False):  # a move is under way: that counts as activity
+            return False
+        try:
+            self.ptz.continuous(0.0, 0.0, 0.0)
+            self._last_command = now
+            return True
+        except Exception:  # noqa: BLE001 - the hunter's own loop reports Server trouble
+            return False
+        finally:
+            self._ptz_lock.release()
 
     def stop(self, wait: bool = True, return_home: bool = True) -> None:
         """Stop hunting. With ``return_home`` False the motor just stops where it is (a replacement hunter takes
         over, and two hunters must never drive the same camera)."""
         self._return_home = return_home
         self._stop.set()
-        if not return_home:
+        if not return_home and self.clock() >= self._handed_over_until:  # never stop an operator's or tracker's move
             try:
                 self.ptz.continuous(0.0, 0.0, 0.0)
             except Exception:  # noqa: BLE001
                 pass
         if wait and self._thread:
             self._thread.join(timeout=300)
+
+    def look_at(self, view: View) -> None:
+        """Go there next and watch it a while (a search result's "Look there"); the hunt carries on after."""
+        self._requested = View.of(view.pan, clamp_tilt(self.config, view.tilt), max(self.config.min_fov, view.fov))
+
+    def take_over_from(self, old: "Hunter") -> None:
+        """A replacement hunter (settings saved) keeps its predecessor's hand-over: an operator who changes the
+        settings while driving the camera keeps it."""
+        self._handed_over_until, self._expected = old._handed_over_until, old._expected
 
     def _pause(self, seconds: float) -> bool:
         """Sleep; False if stopped meanwhile."""
@@ -604,9 +861,17 @@ class Hunter:
         if not (self.memory and self.memory.exists()):
             return None
         data = json.loads(self.memory.read_text())
-        current = isinstance(data, dict) and data.get("version") == MEMORY_VERSION
-        for row in data.get("views", []) if current else []:  # older views: scored by other prompts, re-survey
-            self.stats[View(row["pan"], row["tilt"], row["fov"])] = ViewStats.from_json(row["stats"])
+        version = data.get("version") if isinstance(data, dict) else None
+        for row in data.get("views", []) if version in (2, MEMORY_VERSION) else []:  # older: other prompts, re-survey
+            stats = ViewStats.from_json(row["stats"])
+            if version == 2 and stats.base_avoid >= 0.8 and not stats.extra_avoid:
+                # Version 2 could carry an operator's avoid veto ("Is there a tree in view?", yes almost everywhere)
+                # in base_avoid, which blocks the view for good: a blocked view is never visited, so never rescored.
+                stats.scored, stats.avoid, stats.base_avoid = False, 0.0, 0.0
+            if not stats.scored and stats.scene >= 0.0:
+                stats.prior, stats.scene = 0.5, -1.0  # to be scored again: neutral until then, so it gets visited
+            self.stats[View(row["pan"], row["tilt"], row["fov"])] = stats
+        self.stats = merge_duplicates(self.stats)
         home = data.get("home") if isinstance(data, dict) else None
         return View(home["pan"], home["tilt"], home["fov"]) if home else None
 
@@ -663,32 +928,47 @@ class Hunter:
             for view in survey_views(self.config, self.home, self.magnets):
                 if self._stop.is_set():
                     break
-                if self.stats.get(view) and self.stats[view].visits:
-                    continue  # surveyed in an earlier run
+                if any(s.visits and same_spot(view, v) for v, s in self.stats.items()):
+                    continue  # surveyed in an earlier run (perhaps merged into a view a few degrees off)
                 self.stats.setdefault(view, ViewStats())
+                if not self._wait_while_handed_over():
+                    break
                 try:
                     self._visit(view, survey=True)
+                except ExternalControl as taken:
+                    self._handed_over(self.clock(), taken.where, taken.unstopped, taken.why)
                 except (OSError, ValueError) as error:  # the Server is unreachable (restarting, say)
                     if not self._recover(error):
                         break
             self.status.state = "hunting"
             while not self._stop.is_set():
+                if not self._wait_while_handed_over():
+                    break
                 hour = datetime.fromtimestamp(self.clock()).hour
                 visit_started = self.clock()
-                view = choose_next(self._candidates(), self.status.view, self.clock(), hour, magnets=self.magnets,
-                                   magnet_weight=self.config.magnet_weight, magnet_radius=self.config.magnet_radius,
-                                   since_magnet_s=self.clock() - self.last_magnet_visit,
-                                   magnet_return_s=self.config.magnet_return_s)
+                requested, self._requested = self._requested, None
+                view = requested or choose_next(
+                    self._candidates(), self.status.view, self.clock(), hour, magnets=self.magnets,
+                    magnet_weight=self.config.magnet_weight, magnet_radius=self.config.magnet_radius,
+                    since_magnet_s=self.clock() - self.last_magnet_visit, magnet_return_s=self.config.magnet_return_s,
+                    recent=list(self.recent), bored_weight=self.config.bored_weight)
                 try:
                     self._visit(view, survey=False)
+                    if requested is not None and self._mode != "wide":
+                        self._hold()  # asked for: watch it a while, whatever the boredom cycle says
+                except ExternalControl as taken:
+                    self._handed_over(self.clock(), taken.where, taken.unstopped, taken.why)
+                    continue
                 except (OSError, ValueError) as error:  # the Server is unreachable (restarting, say)
                     if not self._recover(error):
                         break
-                self._spent(self.status.view or view, self.clock() - visit_started)
+                watched = self.status.view or view
+                self.recent.append((self.clock(), watched))
+                self._spent(watched, self.clock() - visit_started)
         except Exception as error:  # noqa: BLE001 - report, then hand the camera back
             fatal, self.status.error = True, repr(error)
         finally:
-            if self.home is not None and self._return_home:
+            if self.home is not None and self._return_home and self.clock() >= self._handed_over_until:
                 self.status.state = "returning"
                 try:
                     move_slowly(self.ptz, self.home, self.config.max_speed, sleep=self.sleep)
@@ -710,12 +990,43 @@ class Hunter:
             self.time_zoomed += seconds
 
     def _candidates(self) -> dict[View, ViewStats]:
-        """Wide views while the hunter has spent less than ``wide_share`` of its recent time wide; otherwise it gets
-        bored and looks closer, at zoomed views (all views when there are none of the kind wanted)."""
-        total = self.time_wide + self.time_zoomed
-        want_wide = total <= 0.0 or self.time_wide / total < self.config.wide_share
+        """The boredom cycle: ``wide_share`` of each ``cycle_s`` watching wide views; then the hunter gets bored and
+        looks around close up, at zoomed spots (found by the helper questions, or by a tile that looked like a yes),
+        briefly, before going back to wide. With no zoomed spot worth a look it stays wide."""
+        now = self.clock()
+        if self._mode_until is None:  # a cycle starts by watching
+            self._mode_until = now + self.config.wide_share * self.config.cycle_s
+        if now >= self._mode_until:
+            if self._mode == "wide":
+                self._mode, self._mode_until = "looking around", now + (1.0 - self.config.wide_share) * self.config.cycle_s
+            else:
+                self._mode, self._mode_until = "wide", now + self.config.wide_share * self.config.cycle_s
+        want_wide = self._mode == "wide" or self.config.wide_share >= 1.0
         chosen = {v: s for v, s in self.stats.items() if self._is_wide(v) == want_wide}
-        return chosen if any(s.avoid < 0.8 for s in chosen.values()) else self.stats
+        if not any(s.avoid < 0.8 and not hopeless(s) for s in chosen.values()):
+            self._mode = "wide"
+            return {v: s for v, s in self.stats.items() if self._is_wide(v)} or self.stats
+        return chosen
+
+    def _wait_while_handed_over(self) -> bool:
+        """While someone else has the camera, send nothing and wait; then carry on from wherever they left it.
+        False if stopped meanwhile."""
+        if self.clock() >= self._handed_over_until:
+            return True
+        phase, began = self.status.state, self.clock()
+        self.status.state = "handed over"
+        while self.clock() < self._handed_over_until:
+            if not self._pause(2.0):
+                return False
+        if self._mode_until is not None:  # the boredom cycle pauses while someone else has the camera
+            self._mode_until += self.clock() - began
+        self.status.state, self.status.error = phase, self.warning
+        try:
+            self._expected = self.ptz.position()
+        except Exception:  # noqa: BLE001 - the next move reads it again
+            self._expected = None
+        self.status.view = None  # the next move starts from wherever they left it
+        return True
 
     def _recover(self, error: Exception) -> bool:
         """The Server stopped answering mid-hunt: stop the motor if it can, wait until the PTZ answers again, and
@@ -747,7 +1058,16 @@ class Hunter:
         self.move_log.append((started, float("inf")))
         zoomed = False
         try:
-            after, zoomed = self._move(before, target)
+            with self._ptz_lock:
+                after, zoomed = self._move(before, target)
+                self._expected = after
+            self._last_command = time.time()
+            if zoomed:
+                self._quiet_until = time.time() + self.config.focus_s
+                # The zoom reads back late: until it has settled, the watcher has nothing to compare with (with the
+                # zoom-out still reading 15.7 degrees after focus_s, the watcher took the hunter's own zoom for an
+                # operator's).
+                self._expected = None
         finally:
             # Refocusing after a zoom blurs the picture: windows over it are camera motion too.
             self.move_log[-1] = (started, self.clock() + self.config.settle_s + (self.config.focus_s if zoomed else 0.0))
@@ -756,11 +1076,33 @@ class Hunter:
         else:
             self.status.moves += 1
         self.move_log = self.move_log[-50:]
-        arrived = view if after.distance(view) <= max(3.0, 0.1 * view.fov) else View.of(after.pan, after.tilt, after.fov)
+        # Close enough is the same view; otherwise the spot it is at (an existing view there, else a new one), so what
+        # is learned is not spread over copies a degree or two apart.
+        actual = View.of(after.pan, after.tilt, after.fov)
+        arrived = view if same_spot(actual, view) else next((v for v in self.stats if same_spot(actual, v)), actual)
         if arrived != self.status.view:
             self._arrived_at = self.clock()
         self.status.view = arrived
-        return arrived if self._pause(self.config.settle_s + (self.config.focus_s if zoomed else 0.0)) else None
+        if not self._pause(self.config.settle_s + (self.config.focus_s if zoomed else 0.0)):
+            return None
+        if zoomed:  # the zoom reads back late: where it settled is where the hunter left it
+            with self._ptz_lock:
+                self._expected = self._settled_zoom(target.fov)
+        return arrived
+
+    def _settled_zoom(self, fov: float, wait_s: float = 8.0) -> View:
+        """The position once the zoom reads back as asked for, or has read the same for 3 s (the zoom may stop short),
+        or after ``wait_s``."""
+        now, same_since, waited = self.ptz.position(), 0.0, 0.0
+        while abs(now.fov - fov) > max(2.0, 0.1 * fov) and waited < wait_s:
+            self.sleep(1.0)
+            waited += 1.0
+            again = self.ptz.position()
+            same_since = same_since + 1.0 if abs(again.fov - now.fov) < 0.5 else 0.0
+            now = again
+            if same_since >= 3.0:
+                break
+        return now
 
     def _move(self, before: View, target: View) -> tuple[View, bool]:
         """Pan and tilt slowly (the motors are loud); zoom in one quick step (it is silent): out before panning, so the
@@ -793,10 +1135,14 @@ class Hunter:
             now = self.ptz.position()
         except Exception:  # noqa: BLE001 - cannot tell: assume it is
             return True
-        if now.distance(view) <= max(3.0, 0.1 * view.fov):
+        # Compared with where the camera really stopped, not ``view``: an arrival is learned as the known view at that
+        # spot, which can be a quarter of a field of view away (4.7 degrees close up), so every look there handed over.
+        ref = self._expected or view
+        if abs(angle_delta(now.pan, ref.pan)) <= 2.5 and abs(now.tilt - ref.tilt) <= 2.5 \
+                and abs(now.fov - ref.fov) <= max(2.0, 0.1 * ref.fov):
             return True
-        self.status.error = f"camera was moved to pan {now.pan:.1f} tilt {now.tilt:.1f}: answers dropped"
-        self.status.view = View.of(now.pan, now.tilt, now.fov)
+        self._handed_over(self.clock(), now, why=f"snapshot check: expected pan {ref.pan:.1f} tilt {ref.tilt:.1f} "
+                                                f"fov {ref.fov:.1f}")
         return False
 
     def _look(self, survey: bool, view: View) -> tuple[float, str, tuple | None] | None:
@@ -811,7 +1157,23 @@ class Hunter:
         questions = dict(hunt)
         stats = self.stats.setdefault(view, ViewStats())
         self._last_jpeg = jpeg
-        if survey or not stats.scored or (cfg.cues and not stats.cues):
+        if self.embedder is not None:
+            # Every look: the frame and its tiles into the map (about 0.45 s next to Clef), and the view's good-place
+            # share, which can rule it out before Clef's scene questions.
+            try:
+                boxes9 = tile_boxes(3)
+                frame, tile_vectors, thumb = self.embedder.look(jpeg, boxes9)
+                stats.embed = self.embedder.share(frame)
+                self._look_vectors = (jpeg, tile_vectors)
+                if self.embed_map is not None:
+                    self.embed_map.add_look(view, frame, tile_vectors, boxes9, thumb)
+            except Exception:  # noqa: BLE001 - the embedding server is down: Clef scores the view as before
+                self._look_vectors = None
+        if hopeless(stats):
+            # Nothing a person could be on: Clef's scene questions would only confirm it. The hunt questions are
+            # still asked (this look is not wasted), and the view is never chosen for hunting again.
+            stats.scored, stats.scene = True, max(0.0, stats.embed)
+        elif survey or not stats.scored or (cfg.cues and not stats.cues):
             questions.update(likelihood_questions(cfg.targets, cfg.interests, cfg.avoid, cfg.cues))
         answers = self._ask(jpeg, questions)
         if answers is None:
@@ -830,7 +1192,7 @@ class Hunter:
         self.status.last_answers = {q: round(a["true"], 3) for q, a in answers.items() if "true" in a}
         best = max(((answers[q]["true"], cfg.targets[int(q[1:])], None) for q in hunt), key=lambda b: b[0])
         self._last_look_p = best[0]
-        boxes = tile_boxes(cfg.tiles) if stats.avoid < 0.8 else []
+        boxes = tile_boxes(cfg.tiles) if stats.avoid < 0.8 and not hopeless(stats) else []
         if boxes:
             tiles = [self.crop(jpeg, *box) for box in boxes]
             # Clef says well whether something is in any of several images, not which: ask all the tiles at once, and
@@ -897,11 +1259,14 @@ class Hunter:
         self._save()
         if not survey and self._worth_holding(view):
             self._scan_tiles(view, self._last_jpeg)
-            self._hold()
+            if self._mode == "wide":  # looking around is a quick look at each spot; watching is holding
+                self._hold()
         if not survey and stats.prior >= 0.6:  # explore around promising views
             half = view.fov * cfg.overlap / 2
             for pan in (view.pan - half, view.pan + half):
-                self.stats.setdefault(View.of(pan, view.tilt, view.fov), ViewStats(prior=stats.prior * 0.9))
+                neighbour = View.of(pan, view.tilt, view.fov)
+                if not any(same_spot(neighbour, v) for v in self.stats):
+                    self.stats[neighbour] = ViewStats(prior=stats.prior * 0.9)
 
     def _reprice(self) -> None:
         """Each view's prior and avoid: its scene score, raised by helper answers and lowered by the operator's avoid
@@ -926,6 +1291,27 @@ class Hunter:
                 or view.fov < 0.4 * self.home.fov or self.clock() - stats.cue_scan_at < CUE_RESCAN_S):
             return
         boxes = tile_boxes(cfg.tiles)
+        if self.embedder is not None:
+            try:
+                if self._look_vectors is None or self._look_vectors[0] is not jpeg or cfg.tiles != 3:
+                    _, vectors, _ = self.embedder.look(jpeg, boxes)
+                else:
+                    vectors = self._look_vectors[1]  # this look's tiles were embedded already
+                shares, sims = self.embedder.tile_scores(vectors, list(cfg.cues))
+            except Exception:  # noqa: BLE001 - the embedding server is down: ask Clef tile by tile, as before
+                shares = None
+            if shares is not None:
+                stats.cue_scan_at = self.clock()
+                for index, score, cue in embedding.standout_tiles(sims)[:ZOOM_CHILDREN]:
+                    if shares[index] < embedding.HOPELESS:
+                        continue  # the cue stands out, but the tile is mostly wall, roof or leaves
+                    child = zoom_on(view, boxes[index], cfg.min_fov)
+                    if any(v.fov < view.fov and v.distance(child) < 0.25 * child.fov for v in self.stats):
+                        continue
+                    self.stats[child] = ViewStats(prior=stats.prior * (0.5 + 0.5 * score), found_by=cue,
+                                                  embed=shares[index])
+                self._save()
+                return
         questions = {f"c{i}": noul(text) for i, text in enumerate(cfg.cues)}
         tiles = []
         for box in boxes:
@@ -975,7 +1361,7 @@ class Hunter:
             return
         phase = self.status.state
         self.status.state = "holding"
-        while not self._stop.is_set():
+        while not self._stop.is_set() and self.clock() >= self._handed_over_until:
             held = self.clock() - self._arrived_at
             if self.clock() < self._window_yes_until and held < cfg.max_dwell_s:
                 pass

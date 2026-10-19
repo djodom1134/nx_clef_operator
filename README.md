@@ -18,8 +18,15 @@ camera ──► Nx Server plugin (C++, plugin/)  ──jobs──►  Clef gate
 | `clef_operator/schedule.py` | Priority queue: class, then motion rank, then deadline; merging, expiry, promotion |
 | `clef_operator/events.py` | Questions and the answer-to-event state machine |
 | `clef_operator/classify.py` | Clef picks a question's fps, priority and whether it needs motion |
-| `clef_operator/gateway.py` | The gateway HTTP service (`/v1/jobs`, `/v1/classify`, `/v1/status`, `/health`) |
+| `clef_operator/gateway.py` | The gateway HTTP service (`/v1/jobs`, `/v1/classify`, `/v1/status`, `/health`, dashboard at `/`) |
+| `clef_operator/dashboard.py` | The dashboard's data: answers per camera and question over time, Clef per minute |
+| `clef_operator/static/dashboard.html` | The dashboard page (no external libraries: it runs inside Nx's browser) |
+| `clef_operator/static/strip.html` | One camera's status strip (`/strip?camera=<id>`), to sit beside the camera in an Nx layout |
+| `scripts/nx_strips.py` | Adds a Web Page per Clef camera's strip and the shared layout "Clef status" to Nx |
 | `clef_operator/replay.py` | Offline replay: recording in, windows through the gateway, events out |
+| `clef_operator/embed.py` | EmbeddingGemma 2 client: a view's good-place share, tile cues (the hunter's cheap looks) |
+| `clef_operator/embed_map.py` | Each PTZ's embedding map in (pan, tilt, field of view), searchable with plain text |
+| `scripts/embed_server.py`, `scripts/embed.sh` | The EmbeddingGemma 2 server next to Clef (DGX, port 8300) |
 | `clef_operator/hunter.py` | PTZ hunter: slow continuous-mode moves, survey, view scoring (positive and negative prompts), magnets, dwell |
 | `clef_operator/profile.py` | Learned camera profiles (hourly survey tallies) |
 | `bench/` | M0 benchmarks (timing per fps, resolution) |
@@ -95,6 +102,39 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
   refocuses. It spends `wide_share` of its time zoomed all the way out (default 75%, "Time zoomed all the way out");
   the rest it looks closer, at zoomed views found by the helper questions, two levels deep (about 18 and 9 degrees).
 - When the Server stops answering mid-hunt (a restart), the hunter stops the motor, waits for the PTZ and carries on.
+- The hunter gets bored: in each 4-minute cycle it is wide for `wide_share`, then looks around at zoomed views; and
+  each recent visit (fading over 10 minutes) scales the appeal of nearby views by 0.4 (up to four visits' worth), so
+  it moves between the areas likely to show the target. Negative prompts weigh on every choice (value = yield x
+  (1 - avoid)), and views with no chance of a yes are never hunted: mostly wall, roof or sky (built-in blockers 0.5 or
+  more), little open ground (scene under 0.15), or avoid answers at 0.7 or more, where the target was never found. On
+  Back PTZ that rules out 22 of 35 wide views, the whole house side (pan 72-131) among them. Before, boredom was
+  subtracted: once the good views were all bored, the side of the house (wall 0.68-0.78, under the old 0.8 veto)
+  came out on top. Simulated on the learned views, the spot with finds (pan 175) gets about 1 look in 5 and the rest
+  go to the open yard; nothing picked has an avoid score over 0.57. Views within a quarter of a field of view of
+  each other are merged (513 learned views were near duplicates of 105).
+- Operators and the camera's auto-tracker take precedence. The hunter checks every 2 s that the camera is where it
+  left it (and, during a move, that axes it is not driving stay put); if someone else moved it, it stops without
+  sending even a stop command and leaves the camera alone (no moves, snapshots or keep-alive) for `handback_s`
+  (camera page "Take back after an operator or auto-tracking", default 10 s), restarting the count on every further
+  move, then carries on from wherever the camera was left; the boredom cycle pauses meanwhile, and settings saved
+  meanwhile keep the hand-over (and send no stop). Tested by panning Back PTZ through Nx: handed over within 2 s, the
+  camera did not move until it had been still 10 s (180 s with the old default), then the hunter carried on. Each
+  hand-over is logged. The Server's own idle return to its PTZ home (preset 300 on Back PTZ, which faces the house
+  wall) also counts as someone else moving the camera; with a 10 s take-back the hunter drives it away again.
+- A hand-over mid-move sends no stop (it would cut off the operator), so a false alarm left the hunter's own
+  command running: Back PTZ panned in circles at its tilt end stop for 15 minutes, each move extending the
+  hand-over. Now a takeover during a move counts only once the axes being driven stop following the hunter's command
+  (a zoom readback still settling is not an operator), and after any hand-over the watcher checks the camera: still
+  moving exactly as the hunter drove it (two checks, 2 s apart) means nobody replaced the command, so it stops the
+  motor, logs it and carries on. Two false alarms are gone too: the zoom reads back seconds late, so after a zoom the watcher
+  waits until the zoom reads as asked (it took the hunter's own zoom-out for an operator's); and the check before
+  each snapshot compares with where the camera really stopped, not with the known view it was learned as (up to a
+  quarter of a field of view away). Each hand-over is logged with what triggered it.
+- Back PTZ slows pan and tilt as it zooms in (at 17 degrees of field of view, speed 0.2 pans about 2 degrees a
+  second, not 6), so "the camera follows the hunter's command" means the commanded direction at 10-160% of the
+  commanded rate; matching the rate closely took the hunter's own zoomed-in move for an operator's, then for nobody's
+  (12:00, another runaway, stopped by hand). Last resort: a camera that keeps moving the same way for 60 s while
+  handed over is stopped (a joystick or an auto-tracker does not drive one way for a minute).
 - Clef tells well whether something is in any of several images, not which one: the PTZ hunter asks its 9 tiles in
   one request, and one by one only when that says maybe. An empty view costs 2 requests, not 10.
 - While the PTZ hunter is moving a camera, the gateway drops that camera's windows: their motion is the camera's.
@@ -109,10 +149,47 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
   each snapshot, and does not learn from one taken elsewhere.
 - For view scoring, "Is most of this view vegetation?" says yes to a lawn: the hunter asks for open ground a person
   could stand on, and treats walls, a roof or pergola below, and sky as blockers.
-- Each camera with questions shows the latest answer to every question, small in the lower right of the video: one
-  `nx.clef_operator.answers` object (type flag `nonIndexable`: live and playback, never in Object Search) with a
-  tiny box in the corner and one attribute per question ("YES 0.92", "no 0.02", "closed 0.85", "no motion", or its
-  age when older than a minute), refreshed every second. System setting "Show answers on video" turns it off.
+- The dashboard (`http://<gateway>:8200/`, in Nx as the Web Page "Clef dashboard" under Integrations; with a gateway
+  token add `?token=...`) lists every camera in the Nx system (none are named in code) and shows the ones you pick:
+  a live snapshot, every question's latest answer against its threshold, its probability over the last 1, 6 or 24
+  hours with yes runs as lanes, a table view, the PTZ hunter's map of learned views, and Clef's load and time to
+  answer per class against the targets. The selection and range live in the URL (`#cams=...&range=6`), so Nx layouts
+  can pin different views. History (one point per answered window, one row per minute for Clef) is kept 24 h and
+  saved in the state directory. Answers used to be drawn on the video as an analytics object per camera, but any
+  object makes a camera that records on objects record, so they recorded all the time.
+- The Nx Server Plugin SDK cannot draw text or graphs on video: a plugin only draws analytics objects (boxes, or
+  points with `nx.sys.showAsPoint`, labelled with their attributes). So each camera's answers are a status strip,
+  `/strip?camera=<id>`: a row per question (yes or no against its threshold, probability), its probability over the
+  last hour with yes runs shaded, and the PTZ hunter's state. In Nx it is a Web Page per camera ("Clef · <camera>",
+  under Integrations), and the shared layout "Clef status" puts each camera beside its strip
+  (`scripts/nx_strips.py`; the local admin cannot create layouts owned by a cloud user, so the layout is shared).
+  Clicking a graph in the Nx client plays that camera from then (the start of the answered window nearest the
+  click): the page uses the Desktop Client JavaScript API (`window.vmsApiInit`, then `vms.tab.state()` and
+  `vms.tab.setItemParams(item, {media: {timestampMs, speed}})`; `addItem` if the camera is not on the layout),
+  which needs the Web Page's "Allow using Client API" (the pages are created with it).
+- The hunter never jumps: pan and tilt move only in slow continuous passes (to within 2 degrees); only zoom, which
+  is silent, uses absolute moves. While it holds still it sends a stop command every 60 s: the Server otherwise sends
+  an idle PTZ to its home position at full speed after about 5 minutes (tested: with the keep-alive it stayed put).
+- EmbeddingGemma 2 (`google/embeddinggemma-2`, text and image encoders, bf16, 70 soft tokens an image) runs next to
+  Clef on the DGX (`scripts/embed.sh`, port 8300, 0.9 GB): one look (frame, 9 tiles cut by the server, a thumbnail)
+  takes about 0.45 s while Clef keeps the GPU busy. Its Python is `~/embed/.venv`, which reuses Clef's CUDA torch
+  through a `.pth` file and has its own transformers (5.20; the model needs it, Clef stays on 5.10). On the 37
+  hand-labelled Back PTZ views (`bench/embed_hunter.py`) its good-place share (an open lawn, a path, a patio... against
+  a wall, the roof, leaves close to the camera, the sky) ranks them with Spearman 0.75 (Clef's scene score 0.84); walls
+  scored 0.01-0.25, open yard 0.38-0.82. It is not a person detector (labelled clip frames: AUC 0.90 overall, 0.53 on
+  Front porch), so Clef still asks the hunt questions on every look. What it does for the hunter:
+  - A view scoring under 0.10 is hopeless: Clef's 20 scene questions and its 9-tile request are skipped, and it is
+    never hunted.
+  - Zoom spots come from the look's tile vectors against the helper cues (no Clef request; it was 9, one per tile), and
+    a tile that is itself hopeless does not become a zoomed view.
+  - Every look goes into the camera's embedding map: the frame at its view and each tile at the direction it shows
+    (centred on it, half the field of view), newest per spot, with a thumbnail (`~/.clef_operator/embed_map_<camera>`).
+    The dashboard's hunter map has a search box: plain text ("picnic table", "the gate") colors every direction by
+    similarity and lists the best matches, one per spot, with what matched and "Look there" (the hunter goes there
+    next and watches). PTZ status strips have the same search, top three. API: `GET /v1/hunter_search?camera=&q=`,
+    `GET /v1/hunter_thumb?camera=&shot=`, `POST /v1/hunter_look {camera_id, pan, tilt, fov}`.
+  - If the embedding server is down, the hunter scores views and scans tiles with Clef as before (it retries after
+    60 s). `--embed ''` turns it off.
 - Analytics events reach the Nx event log only when a rule uses them. Bookmark rules on these prolonged events
   need event state `none` and fire when the event ends.
 
@@ -123,6 +200,8 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
 - Gateway: runs on the DGX next to Clef (`scripts/gateway.sh --clef http://127.0.0.1:8100`, port 8200, log
   `/tmp/clefop_gateway.log`, state in `~/.clef_operator`), started at boot by a `@reboot` crontab line after Clef has
   loaded. ffmpeg there is a static arm64 build in `~/bin`. The plugin's Gateway URL is `http://192.168.87.134:8200`.
+- Embedding server: on the DGX too (`scripts/embed.sh`, port 8300, log `/tmp/embed_server.log`, model in
+  `~/embed/hf`), started at boot by its own `@reboot` crontab line, a minute before the gateway.
 - DGX Spark (Nx in docker `nx-dgx-spark`, host networking, 192.168.87.134:7001) runs the arm64 plugin, built natively in
   `~/nx_clef_operator/build`. It is installed by `/srv/mediaserver/entrypoint.d/20-clef-operator.sh`
   (`plugin/docker-entrypoint-20-clef-operator.sh`), which copies `entrypoint.d/clef_operator/libclef_operator_plugin.so`

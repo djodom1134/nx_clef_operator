@@ -12,7 +12,6 @@
 #include <nx/sdk/analytics/helpers/object_metadata.h>
 #include <nx/sdk/analytics/helpers/object_metadata_packet.h>
 #include <nx/sdk/analytics/helpers/object_track_best_shot_packet.h>
-#include <nx/sdk/analytics/helpers/object_track_title_packet.h>
 #include <nx/sdk/helpers/attribute.h>
 #include <nx/sdk/helpers/uuid_helper.h>
 #include <nx/sdk/analytics/i_compressed_video_packet.h>
@@ -36,9 +35,6 @@ constexpr int kWorkers = 3;
 constexpr int64_t kSecondUs = 1'000'000;
 constexpr int kGatewayTimeoutS = 180;
 const std::string kAnswerObjectType = "nx.clef_operator.answer";
-const std::string kAnswersObjectType = "nx.clef_operator.answers";
-constexpr int64_t kAnswersEveryUs = 1'000'000; //< how often the answers on the video are refreshed
-constexpr int64_t kAnswersStaleUs = 60 * kSecondUs; //< older answers are shown with their age
 
 std::string eventTypeFor(const std::string& priority)
 {
@@ -77,8 +73,7 @@ DeviceAgent::DeviceAgent(Engine* engine, const IDeviceInfo* deviceInfo):
     ConsumingDeviceAgent(deviceInfo, /*enableOutput*/ false),
     m_engine(engine),
     m_cameraId(deviceInfo->id()),
-    m_cameraName(deviceInfo->name()),
-    m_answersTrackId(UuidHelper::randomUuid())
+    m_cameraName(deviceInfo->name())
 {
     for (int i = 0; i < kWorkers; ++i)
         m_workers.emplace_back([this]() { runTasks(); });
@@ -106,7 +101,6 @@ std::string DeviceAgent::manifestString() const
     }
     types.push_back(Json::object{{"objectTypeId", kAnswerObjectType},
         {"attributes", Json::array{"Question", "Answer", "Probability", "Zone", "Priority"}}});
-    types.push_back(Json::object{{"objectTypeId", kAnswersObjectType}});
     return Json(Json::object{{"supportedTypes", types}}).dump();
 }
 
@@ -172,7 +166,7 @@ std::string DeviceAgent::updateHunter(const CameraConfig& camera, const SystemCo
         {"presets", Json::array(h.presets.begin(), h.presets.end())},
         {"threshold", h.threshold}, {"max_speed", h.maxSpeed}, {"rest_s", h.restSeconds},
         {"dwell_s", h.dwellSeconds}, {"pan_min", h.panMin}, {"pan_max", h.panMax},
-        {"wide_share", h.widePercent / 100.0}, {"focus_s", h.focusSeconds},
+        {"wide_share", h.widePercent / 100.0}, {"focus_s", h.focusSeconds}, {"handback_s", h.handBackSeconds},
     };
     if (!h.enabled && !m_hunterWasEnabled)
         return "off";
@@ -239,11 +233,6 @@ bool DeviceAgent::pushCompressedVideoFrame(Ptr<const ICompressedVideoPacket> fra
 {
     const int64_t ts = frame->timestampUs();
     m_lastFrameUs = ts;
-    if (ts - m_lastAnswersUs >= kAnswersEveryUs && m_engine->systemConfig()->showAnswers)
-    {
-        m_lastAnswersUs = ts;
-        pushAnswers(ts);
-    }
     std::string extradata;
     if (const auto context = frame->context(); context && context->extradataSize() > 0)
         extradata.assign(context->extradata(), (size_t) context->extradataSize());
@@ -352,7 +341,6 @@ void DeviceAgent::processWindow(Window window)
             std::lock_guard<std::mutex> lock(m_mutex);
             if (!m_liveQuestions.count(q.id))
                 continue;
-            m_answers[q.id] = {answerLabel(q.text, zone ? zone->name : std::string()), "no motion", window.endUs};
             const auto t = m_events[q.id].update(window.startUs, window.endUs, std::nullopt,
                 q.onThreshold, q.offThreshold, system->closeAfter);
             if (t)
@@ -389,6 +377,7 @@ void DeviceAgent::processWindow(Window window)
         [&](Group& g)
         {
             Json::object questionsJson;
+            Json::object alertsJson;
             for (const auto& r: g.questions)
             {
                 const auto& q = r.config;
@@ -405,13 +394,15 @@ void DeviceAgent::processWindow(Window window)
                     qj["criteria"] = Json::array(q.options.begin(), q.options.end());
                 }
                 questionsJson[q.id] = qj;
+                // For the gateway's dashboard: when this question's answer counts as yes.
+                alertsJson[q.id] = Json::object{{"on", q.onThreshold}, {"alert_on", Json::array(q.alertOn.begin(), q.alertOn.end())}};
             }
             Json::object body{
                 {"camera_id", m_cameraId}, {"camera_name", m_cameraName}, {"camera_description", camera.description},
                 {"window_start", window.startUs / 1e6}, {"window_end", window.endUs / 1e6},
                 {"priority", g.priority}, {"fps", g.fps}, {"motion", toString(g.motion)},
                 {"site", Json::object{{"interests", system->siteInterests}, {"nuisance", nuisanceJson}}},
-                {"questions", questionsJson},
+                {"questions", questionsJson}, {"alerts", alertsJson},
                 {"clip", clip}, {"clip_format", "annexb"}, {"codec", window.codec}, {"clip_fps", window.fps},
                 {"timeout", kGatewayTimeoutS},
             };
@@ -450,8 +441,6 @@ void DeviceAgent::processWindow(Window window)
                 for (const auto& [option, p]: result["answers"][r.config.id].object_items())
                     answer[option] = p.number_value();
                 const double p = alertProbability(r.config, answer);
-                m_answers[r.config.id] = {answerLabel(r.config.text, g.zone ? g.zone->name : std::string()),
-                    answerText(r.config, answer, p), window.endUs};
                 const auto t = m_events[r.config.id].update(window.startUs, window.endUs, p,
                     r.config.onThreshold, r.config.offThreshold, system->closeAfter);
                 if (t)
@@ -467,53 +456,6 @@ void DeviceAgent::processWindow(Window window)
         senders.emplace_back([&submit, &g]() { submit(g); });
     for (auto& sender: senders)
         sender.join();
-}
-
-void DeviceAgent::pushAnswers(int64_t timestampUs)
-{
-    std::vector<std::pair<std::string, std::string>> lines;
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        for (const auto& [id, line]: m_answers)
-        {
-            if (!m_liveQuestions.count(id))
-                continue; //< Removed or turned off.
-            const int64_t age = timestampUs - line.windowEndUs;
-            lines.emplace_back(line.label, age > kAnswersStaleUs
-                ? line.text + " (" + std::to_string(age / kSecondUs) + " s ago)" : line.text);
-        }
-    }
-    if (lines.empty())
-        return;
-
-    // A small box in the lower right corner; Nx draws the attributes beside it.
-    const Rect box(0.97F, 0.95F, 0.02F, 0.03F);
-    auto object = makePtr<ObjectMetadata>();
-    object->setTypeId(kAnswersObjectType);
-    object->setTrackId(m_answersTrackId);
-    object->setBoundingBox(box);
-    std::string title;
-    for (const auto& [label, text]: lines)
-    {
-        object->addAttribute(makePtr<Attribute>(label, text));
-        title += (title.empty() ? "" : " | ") + label + " " + text;
-    }
-    auto packet = makePtr<ObjectMetadataPacket>();
-    packet->setTimestampUs(timestampUs);
-    packet->setDurationUs(kAnswersEveryUs * 3 / 2); //< until the next refresh, with some slack
-    packet->addItem(object);
-    pushMetadataPacket(packet);
-
-    if (title != m_lastAnswersTitle)
-    {
-        m_lastAnswersTitle = title;
-        auto titlePacket = makePtr<ObjectTrackTitlePacket>();
-        titlePacket->setTimestampUs(timestampUs);
-        titlePacket->setTrackId(m_answersTrackId);
-        titlePacket->setBoundingBox(box);
-        titlePacket->setText(title);
-        pushMetadataPacket(titlePacket);
-    }
 }
 
 void DeviceAgent::emitEvent(const QuestionConfig& q, const std::string& priority, const Zone* zone,

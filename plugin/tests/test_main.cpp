@@ -200,30 +200,9 @@ static void testHunterCues()
 {
     const auto defaults = parseCameraConfig(Settings{}, SystemConfig());
     CHECK(defaults.hunter.cues.size() == 5 && defaults.hunter.cues[1] == "Is there a gate?");
-    CHECK(defaults.hunter.widePercent == 75 && defaults.hunter.focusSeconds == 4);
+    CHECK(defaults.hunter.widePercent == 75 && defaults.hunter.focusSeconds == 4 && defaults.hunter.handBackSeconds == 10);
     const auto custom = parseCameraConfig(Settings{{"hunter.cues", "Is there a bench?; Is there a door?"}}, SystemConfig());
     CHECK(custom.hunter.cues.size() == 2 && custom.hunter.cues[1] == "Is there a door?");
-}
-
-static void testAnswerText()
-{
-    QuestionConfig car;
-    car.kind = "noul";
-    car.onThreshold = 0.8;
-    CHECK(answerText(car, {{"true", 0.92}, {"false", 0.08}}, 0.92) == "YES 0.92");
-    CHECK(answerText(car, {{"true", 0.02}, {"false", 0.98}}, 0.02) == "no 0.02");
-    CHECK(answerText(car, {{"true", 0.6}}, 0.6) == "no 0.60"); //< below the on-threshold: not an alert yet
-    QuestionConfig door;
-    door.kind = "choice";
-    door.options = {"open", "closed"};
-    door.alertOn = {"open"};
-    door.onThreshold = 0.8;
-    CHECK(answerText(door, {{"open", 0.15}, {"closed", 0.85}}, 0.15) == "closed 0.85");
-    CHECK(answerText(door, {{"open", 0.91}, {"closed", 0.09}}, 0.91) == "OPEN 0.91");
-    CHECK(answerText(door, {}, 0.0) == "-");
-    CHECK(answerLabel("Is a car parked?", "") == "Is a car parked?");
-    CHECK(answerLabel("Is a car parked?", "Driveway") == "Driveway: Is a car parked?");
-    CHECK(answerLabel(std::string(60, 'x'), "").size() == 40);
 }
 
 int main()
@@ -236,7 +215,6 @@ int main()
     testBestShot();
     testZoneMotionCountsFastCrossings();
     testEventState();
-    testAnswerText();
     testHunterCues();
     std::printf(failures ? "%d FAILED\n" : "all passed\n", failures);
     return failures ? 1 : 0;
