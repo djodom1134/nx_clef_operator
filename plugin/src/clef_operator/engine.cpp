@@ -23,7 +23,6 @@ const std::vector<std::pair<std::string, std::string>> kEventTypes = {
 };
 const std::string kNuisanceEventType = "nx.clef_operator.nuisance";
 const std::string kAnswerObjectType = "nx.clef_operator.answer";
-const std::string kAnswersObjectType = "nx.clef_operator.answers"; //< the answers shown on the video
 const std::string kHealthEventType = "nx.clef_operator.health";
 
 Engine::Engine():
@@ -63,8 +62,6 @@ std::string Engine::manifestString() const
                 Json::object{{"type", "String"}, {"name", "Zone"}},
                 Json::object{{"type", "String"}, {"name", "Priority"}},
             }}},
-            // Telemetry, not something to search for: shown live and in playback, kept out of Object Search.
-            Json::object{{"id", kAnswersObjectType}, {"name", "Clef answers"}, {"flags", "nonIndexable"}},
         }}}},
         {"deviceAgentSettingsModel", Json::parse(deviceAgentSettingsModel(), error)},
     }).dump();

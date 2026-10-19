@@ -8,6 +8,13 @@
     GET  /v1/profile?camera_id=...      the camera's learned profile for the current hour
     POST /v1/profile/reset {"camera_id"} forget a camera's learned profile (e.g. after it was moved)
     GET  /health        gateway and Clef server status
+    GET  /              the dashboard page (add it to Nx as a Web Page, under Integrations)
+    GET  /v1/dashboard[?cameras=id,id]        latest answers per camera, Clef load, latency, PTZ hunters
+    GET  /v1/cameras                          every camera in the Nx system, and which have answers or a hunter
+    GET  /v1/history?camera=id&hours=6        a camera's answers over time (downsampled), yes spans, time to answer
+    GET  /v1/system_history?hours=6           per minute: Clef busy share, answers, time to answer per class
+    GET  /v1/snapshot?camera=id               the camera's latest frame, small (JPEG)
+    GET  /v1/hunter_map?camera=id             a PTZ hunter's learned views (pan, tilt, zoom, yield, quiet)
 
 A job body:
 
@@ -41,11 +48,15 @@ import threading
 import time
 import traceback
 from collections import deque
+from urllib.parse import parse_qs, urlsplit
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from .classify import classify
+from .dashboard import AnswerBoard, SystemHistory, page, strip_page
+from .embed import Embedder
+from .embed_map import EmbedMap
 from .hunter import Hunter, HunterConfig, NxPtz, View
 from .clef import Clef, image_data_url, video_data_url
 from .nx import Nx
@@ -214,6 +225,15 @@ def latency_summary(records) -> dict:
     return out
 
 
+def scale_jpeg(jpeg: bytes, width: int) -> bytes:
+    with tempfile.TemporaryDirectory() as tmp:
+        src, dst = Path(tmp) / "in.jpg", Path(tmp) / "out.jpg"
+        src.write_bytes(jpeg)
+        subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", str(src), "-vf", f"scale='min({width},iw)':-2",
+                        "-q:v", "4", "-y", str(dst)], check=True, timeout=30)
+        return dst.read_bytes()
+
+
 def finish(job: Job, result: dict) -> None:
     """Hand a job's result to its caller, or to each bundled caller with only its own answers."""
     parts: list[Part] | None = job.payload.get("parts")
@@ -232,8 +252,10 @@ def finish(job: Job, result: dict) -> None:
 
 class Gateway:
     def __init__(self, clef: Clef, max_pixels: int, profiles: ProfileStore | None = None,
-                 state_dir: Path | None = None) -> None:
+                 state_dir: Path | None = None, embedder: Embedder | None = None) -> None:
         self.clef, self.max_pixels = clef, max_pixels
+        self.embedder = embedder  # EmbeddingGemma for the PTZ hunters' cheap looks (embed.py); None: Clef only
+        self.embed_maps: dict[str, EmbedMap] = {}  # camera -> what each direction looked like (embed_map.py)
         self.state_dir = state_dir
         self.presets_path = (state_dir / "ptz_presets.json") if state_dir else None
         self.profiles = profiles or ProfileStore()
@@ -243,11 +265,19 @@ class Gateway:
         self.scheduler = Scheduler()
         self.wake = threading.Condition()
         self.bundles: dict[tuple, list[Part]] = {}  # (camera, window end) -> parts still gathering
+        # The dashboard: answers per camera and question over time, and the system per minute (saved, so restarts
+        # keep the graphs).
+        self.board = AnswerBoard(state_dir / "dashboard_answers.json" if state_dir else None)
+        self.system_history = SystemHistory(state_dir / "dashboard_system.json" if state_dir else None)
+        self._clef_health: tuple[float, dict] = (0.0, {})
+        self._cameras_cache: tuple[float, list] = (0.0, [])
+        self._snapshots: dict[str, tuple[float, bytes]] = {}
         self.bundle_lock = threading.Lock()
         self.busy: deque[tuple[float, float]] = deque()  # (start, end) of model requests, last hour
         self.latency: deque[tuple] = deque()  # (answered at, class, seconds from arrival, on time, lowered, camera), last hour
         self.started = time.time()
         threading.Thread(target=self._work, daemon=True, name="worker").start()
+        threading.Thread(target=self._save_dashboard_loop, daemon=True, name="dashboard-save").start()
         threading.Thread(target=self._sweep, daemon=True, name="sweeper").start()
 
     # The worker: one Clef request at a time, always the best job next.
@@ -291,6 +321,10 @@ class Gateway:
                 }
                 shown = " ".join(f"{q}={a['true']:.2f}" if "true" in a else f"{q}={max(a, key=a.get)}"
                                  for q, a in answered.answers.items())
+                for part in job.payload.get("parts", ()):
+                    own = {qid: answered.answers[sent] for sent, qid in part.ids.items() if sent in answered.answers}
+                    self.board.record(part.body, own, job.fps, job.priority.name.lower(),
+                                      time.time() - job.arrived if job.arrived else None)
                 callers = len(job.payload.get("parts", ())) or 1
                 group = job.group + (f"+{callers - 1}" if callers > 1 else "")
                 lowered = f" (from {job.requested_fps:g} fps)" if job.fps < job.requested_fps else ""
@@ -305,6 +339,10 @@ class Gateway:
                 if result.get("status") == "answered" and job.arrived:
                     self.latency.append((ended, job.priority.name, ended - job.arrived, ended <= job.due(),
                                          job.fps < job.requested_fps, camera_label(job)))
+                answered_ok = result.get("status") == "answered" and job.arrived
+                self.system_history.add(started, ended, job.priority.name.lower() if answered_ok else None,
+                                        ended - job.arrived if answered_ok else None,
+                                        ended <= job.due() if answered_ok else None, job.fps < job.requested_fps)
                 finish(job, result)
 
     # Dropped jobs (expired or merged) never reach the worker; release their callers.
@@ -488,8 +526,13 @@ class Gateway:
                 log(f"hunter generic event failed: {error!r}")
 
         memory = (self.state_dir / f"hunter_{camera_id}.json") if self.state_dir else None
+        if camera_id not in self.embed_maps:
+            self.embed_maps[camera_id] = EmbedMap(self.state_dir / f"embed_map_{camera_id}.json" if self.state_dir else None)
         hunter = Hunter(config, NxPtz(self.nx, camera_id), ask, on_found=found,
-                        locate_preset=lambda preset: self.locate_preset(camera_id, preset), memory=memory)
+                        locate_preset=lambda preset: self.locate_preset(camera_id, preset), memory=memory,
+                        embedder=self.embedder, embed_map=self.embed_maps[camera_id])
+        if old:
+            hunter.take_over_from(old)
         self.hunters[camera_id] = hunter
         hunter.start()
         self._save_hunter_configs()
@@ -551,10 +594,107 @@ class Gateway:
                 "state": st.state, "view": vars(st.view) if st.view else None, "found": st.found, "error": st.error,
                 "moves": st.moves, "last_answers": st.last_answers,
                 "hot_spots": [{"view": vars(v), "finds": s.total_hits, "visits": s.visits} for v, s in h.hot_spots()],
+                "camera_name": h.config.camera_name.strip(),
+                "mode": h._mode, "handed_over_s": max(0, round(h._handed_over_until - time.time())),
+                "wide_share": round(h.time_wide / (h.time_wide + h.time_zoomed), 2) if h.time_wide + h.time_zoomed else None,
                 "best_views": [r for r in learned if not r["quiet"]][:6],
                 "quiet_views": [r["view"] for r in learned if r["quiet"]],
             }
         return out
+
+    def _save_dashboard_loop(self) -> None:
+        while True:
+            time.sleep(300)
+            self.save_dashboard()
+
+    def save_dashboard(self) -> None:
+        try:
+            self.board.save()
+            self.system_history.save()
+        except Exception as error:  # noqa: BLE001 - the dashboard must never break answering
+            log(f"dashboard save failed: {error!r}")
+        self.save_embed_maps()  # also every 5 minutes as the hunters add to them, and on shutdown
+
+    def cameras(self) -> list[dict]:
+        """Every camera in the Nx system (cached a minute), marked with whether it has answers or a hunter."""
+        now = time.time()
+        if now - self._cameras_cache[0] > 60.0:
+            try:
+                found = [vars(c) for c in self.nx.cameras(recording_only=False)]
+                self._cameras_cache = (now, found)
+            except Exception as error:  # noqa: BLE001 - fall back to what the answers know
+                log(f"dashboard: cannot list cameras: {error!r}")
+        answered = {c["id"]: c for c in self.board.cameras(now)}
+        listed = {c["id"]: dict(c) for c in self._cameras_cache[1]}
+        for camera_id, camera in answered.items():
+            listed.setdefault(camera_id, {"id": camera_id, "name": camera["name"], "status": "", "vendor": "", "model": ""})
+        out = []
+        for camera_id, camera in listed.items():
+            board = answered.get(camera_id)
+            out.append({**camera, "has_answers": board is not None, "hunter": camera_id in self.hunters,
+                        "yes": sum(q["yes"] and q["age_s"] < 120 for q in board["questions"]) if board else 0,
+                        "age_s": board["age_s"] if board else None})
+        return sorted(out, key=lambda c: (not c["has_answers"] and not c["hunter"], c["name"].lower()))
+
+    def snapshot(self, camera_id: str, width: int = 640) -> bytes:
+        """The camera's latest frame, scaled down, at most one Nx request per camera every 8 s."""
+        camera_id = camera_id.strip("{}")
+        cached = self._snapshots.get(camera_id)
+        if cached and time.time() - cached[0] < 8.0:
+            return cached[1]
+        jpeg = scale_jpeg(self.nx.snapshot(camera_id), width)
+        self._snapshots[camera_id] = (time.time(), jpeg)
+        return jpeg
+
+    def hunter_map(self, camera_id: str) -> dict:
+        hunter = self.hunters.get(camera_id.strip("{}"))
+        if hunter is None:
+            return {"views": []}
+        hour = datetime.now().hour
+        return {"camera_name": hunter.config.camera_name.strip(), "state": hunter.status.state, "mode": hunter._mode,
+                "handed_over_s": max(0, round(hunter._handed_over_until - time.time())),
+                "view": vars(hunter.status.view) if hunter.status.view else None,
+                "home": vars(hunter.home) if hunter.home else None, "magnets": [vars(m) for m in hunter.magnets],
+                "pan_range": [hunter.config.pan_min, hunter.config.pan_max], "views": hunter.learned(hour),
+                "embedded": len(self.embed_maps[camera_id.strip("{}")].entries) if camera_id.strip("{}") in self.embed_maps else 0}
+
+    def hunter_search(self, camera_id: str, text: str, top: int = 8) -> dict:
+        """Plain-text search over what a PTZ hunter has seen: every map entry's similarity to ``text`` and the best."""
+        camera_id = camera_id.strip("{}")
+        emap = self.embed_maps.get(camera_id)
+        if emap is None or self.embedder is None:
+            return {"error": "no embedding map for this camera", "entries": 0, "map": [], "top": []}
+        (query,) = self.embedder.texts([text.strip()], "query")
+        return {"query": text, **emap.search(query, top)}
+
+    def hunter_look(self, camera_id: str, pan: float, tilt: float, fov: float) -> dict:
+        hunter = self.hunters.get(camera_id.strip("{}"))
+        if hunter is None:
+            return {"error": "no hunter on this camera"}
+        hunter.look_at(View(pan, tilt, fov))
+        return {"status": "next", "view": {"pan": pan, "tilt": tilt, "fov": fov}}
+
+    def save_embed_maps(self) -> None:
+        for emap in list(self.embed_maps.values()):
+            try:
+                emap.save()
+            except OSError as error:
+                log(f"embedding map save failed: {error!r}")
+
+    def dashboard(self, only: set[str] | None = None) -> dict:
+        now = time.time()
+        if now - self._clef_health[0] > 5.0:  # every viewer polls every 2 s: ask Clef at most every 5 s
+            try:
+                health = self.clef.health()
+            except Exception as error:  # noqa: BLE001
+                health = {"status": "unreachable", "error": str(error)}
+            self._clef_health = (now, health)
+        status = self.status()
+        by_camera = status["latency_by_camera_1h"]
+        cameras = [{**camera, "latency": by_camera.get(camera["name"])} for camera in self.board.cameras(now, only)]
+        return {"generated_at": now, "clef": {k: self._clef_health[1].get(k) for k in ("status", "precision")},
+                "busy_1m": status["busy_1m"], "busy_10m": status["busy_10m"], "queue": status["queue"],
+                "latency": status["latency_1h"], "cameras": cameras, "hunters": self.hunter_status()}
 
     def status(self) -> dict:
         now = time.time()
@@ -594,7 +734,21 @@ def make_handler(gateway: Gateway, token: str | None):
             return body
 
         def _authorized(self) -> bool:
-            return not token or self.headers.get("Authorization", "") == f"Bearer {token}"
+            if not token or self.headers.get("Authorization", "") == f"Bearer {token}":
+                return True
+            # The dashboard is a web page (Nx shows it as a Web Page resource): it cannot send a header.
+            return parse_qs(urlsplit(self.path).query).get("token", [""])[0] == token
+
+        def _send_html(self, text: str) -> None:
+            self._send_bytes(text.encode(), "text/html; charset=utf-8")
+
+        def _send_bytes(self, data: bytes, content_type: str) -> None:
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
 
         def do_GET(self) -> None:  # noqa: N802
             if self.path == "/health":
@@ -605,6 +759,39 @@ def make_handler(gateway: Gateway, token: str | None):
                 return self._send(200, {"status": "ready" if clef.get("status") == "ready" else "degraded", "clef": clef})
             if not self._authorized():
                 return self._send(401, {"error": "missing or wrong bearer token"})
+            path = urlsplit(self.path).path
+            query = {k: v[0] for k, v in parse_qs(urlsplit(self.path).query).items()}
+            hours = min(24.0, max(0.25, float(query.get("hours", 6) or 6)))
+            if path in ("/", "/dashboard"):
+                return self._send_html(page())
+            if path == "/strip":
+                return self._send_html(strip_page())
+            if path == "/v1/dashboard":
+                only = set(query["cameras"].split(",")) if query.get("cameras") else None
+                return self._send(200, gateway.dashboard(only))
+            if path == "/v1/cameras":
+                return self._send(200, {"cameras": gateway.cameras()})
+            if path == "/v1/history" and query.get("camera"):
+                return self._send(200, gateway.board.history(query["camera"], time.time() - hours * 3600))
+            if path == "/v1/system_history":
+                return self._send(200, {"targets": {p.name.lower(): t for p, t in TARGET_S.items()},
+                                        "minutes": gateway.system_history.series(time.time() - hours * 3600)})
+            if path == "/v1/hunter_map" and query.get("camera"):
+                return self._send(200, gateway.hunter_map(query["camera"]))
+            if path == "/v1/hunter_search" and query.get("camera") and query.get("q"):
+                try:
+                    return self._send(200, gateway.hunter_search(query["camera"], query["q"][:200]))
+                except Exception as error:  # noqa: BLE001 - the embedding server may be down
+                    return self._send(502, {"error": f"search failed: {error!r}"[:200]})
+            if path == "/v1/hunter_thumb" and query.get("camera") and query.get("shot"):
+                emap = gateway.embed_maps.get(query["camera"].strip("{}"))
+                data = emap.thumb(query["shot"]) if emap else None
+                return self._send_bytes(data, "image/jpeg") if data else self._send(404, {"error": "no such thumbnail"})
+            if path == "/v1/snapshot" and query.get("camera"):
+                try:
+                    return self._send_bytes(gateway.snapshot(query["camera"]), "image/jpeg")
+                except Exception as error:  # noqa: BLE001 - the camera may be offline
+                    return self._send(502, {"error": repr(error)[:200]})
             if self.path == "/v1/status":
                 return self._send(200, gateway.status())
             if self.path == "/v1/hunter":
@@ -623,6 +810,9 @@ def make_handler(gateway: Gateway, token: str | None):
                     return self._send(200, gateway.submit(body))
                 if self.path == "/v1/hunter":
                     return self._send(200, gateway.set_hunter(body))
+                if self.path == "/v1/hunter_look":
+                    return self._send(200, gateway.hunter_look(str(body["camera_id"]), float(body["pan"]),
+                                                               float(body["tilt"]), float(body["fov"])))
                 if self.path == "/v1/profile/reset":
                     gateway.profiles.reset(body["camera_id"])
                     return self._send(200, {"status": "reset"})
@@ -651,16 +841,20 @@ def main() -> None:
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8200)
     parser.add_argument("--clef", default=None, help="Clef server URL (default: CLEF_URL)")
+    parser.add_argument("--embed", default="http://127.0.0.1:8300",
+                        help="EmbeddingGemma server for the PTZ hunters' cheap looks (scripts/embed.sh); '' for none")
     parser.add_argument("--max-pixels", type=int, default=MAX_PIXELS, help="frames are shrunk to at most this area")
     parser.add_argument("--state-dir", type=Path, default=Path.home() / ".clef_operator", help="learned profiles live here")
     args = parser.parse_args()
     args.state_dir.mkdir(parents=True, exist_ok=True)
-    gateway = Gateway(Clef(args.clef), args.max_pixels, ProfileStore(args.state_dir / "profiles.json"), args.state_dir)
+    gateway = Gateway(Clef(args.clef), args.max_pixels, ProfileStore(args.state_dir / "profiles.json"), args.state_dir,
+                      Embedder(args.embed) if args.embed else None)
     threading.Thread(target=gateway.restore_hunters, daemon=True).start()
 
     def shutdown(signum, frame) -> None:
         # A hunter killed mid-move would leave the PTZ motor running in continuous mode: stop every motor first.
         # The hunter configs stay saved, so the next start resumes them.
+        gateway.save_dashboard()
         for camera_id, hunter in list(gateway.hunters.items()):
             hunter._stop.set()
             try:

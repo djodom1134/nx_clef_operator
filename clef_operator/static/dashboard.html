@@ -1,0 +1,657 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clef Operator</title>
+<style>
+:root {
+  color-scheme: light;
+  --plane: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11, 11, 11, 0.10); --wash: rgba(11, 11, 11, 0.04);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #6250d6; --s8: #e34948;
+  --q1: #86b6ef; --q2: #5598e7; --q3: #2a78d6; --q4: #1c5cab; --q5: #104281;
+  --good: #0ca30c; --warning: #fab219; --critical: #d03b3b; --critical-wash: rgba(208, 59, 59, 0.10);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --plane: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10); --wash: rgba(255, 255, 255, 0.05);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    --q1: #184f95; --q2: #1c5cab; --q3: #2a78d6; --q4: #5598e7; --q5: #9ec5f4;
+    --critical-wash: rgba(208, 59, 59, 0.22);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --plane: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10); --wash: rgba(255, 255, 255, 0.05);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --q1: #184f95; --q2: #1c5cab; --q3: #2a78d6; --q4: #5598e7; --q5: #9ec5f4;
+  --critical-wash: rgba(208, 59, 59, 0.22);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: var(--plane); color: var(--ink); }
+body { font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+button, input { font: inherit; color: inherit; }
+.top { position: sticky; top: 0; z-index: 5; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px;
+       padding: 12px 16px; background: var(--plane); border-bottom: 1px solid var(--border); }
+.top h1 { font-size: 17px; margin: 0; letter-spacing: .01em; }
+.live { display: inline-flex; align-items: center; gap: 6px; color: var(--ink-2); font-size: 12px; }
+.live i { width: 8px; height: 8px; border-radius: 50%; background: var(--good); }
+.live.off i { background: var(--warning); }
+.spacer { flex: 1; }
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.seg button { border: 0; background: none; padding: 5px 12px; cursor: pointer; color: var(--ink-2); }
+.seg button[aria-pressed="true"] { background: var(--wash); color: var(--ink); font-weight: 600; }
+.icon-btn { border: 1px solid var(--border); background: var(--surface); border-radius: 8px; padding: 5px 10px; cursor: pointer; }
+.layout { display: grid; grid-template-columns: 260px minmax(0, 1fr); gap: 16px; padding: 16px; align-items: start; }
+aside { position: sticky; top: 72px; background: var(--surface); border: 1px solid var(--border); border-radius: 12px;
+        padding: 12px; max-height: calc(100vh - 88px); overflow: auto; }
+aside h2, section > h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; font-weight: 600; }
+.search { width: 100%; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--plane); }
+.quick { display: flex; gap: 6px; margin: 8px 0; }
+.quick button { flex: 1; border: 1px solid var(--border); background: none; border-radius: 6px; padding: 3px 6px; cursor: pointer; font-size: 12px; color: var(--ink-2); }
+.cam-list { list-style: none; margin: 0; padding: 0; }
+.cam-list label { display: grid; grid-template-columns: auto 1fr auto; gap: 8px; align-items: center; padding: 6px 4px;
+                  border-radius: 6px; cursor: pointer; }
+.cam-list label:hover { background: var(--wash); }
+.cam-list .name { overflow-wrap: anywhere; }
+.cam-list .sub { grid-column: 2 / 4; color: var(--muted); font-size: 12px; margin-top: -4px; }
+.badge { font-size: 11px; font-weight: 600; border-radius: 999px; padding: 0 7px; white-space: nowrap; }
+.badge.yes { background: var(--critical-wash); color: var(--critical); }
+.badge.ptz { background: var(--wash); color: var(--ink-2); }
+.cam-list .group { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .06em; margin: 10px 4px 2px; }
+main { min-width: 0; display: grid; gap: 16px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; }
+.tile { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; }
+.tile .label { color: var(--ink-2); font-size: 12px; }
+.tile .value { font-size: 26px; font-weight: 600; margin-top: 2px; }
+.tile .note { color: var(--muted); font-size: 12px; }
+.panels { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 520px), 1fr)); gap: 16px; }
+.panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 14px; min-width: 0; }
+.panel > header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; margin-bottom: 10px; }
+.panel > header h3 { margin: 0; font-size: 16px; }
+.panel > header .meta { color: var(--muted); font-size: 12px; }
+.panel .body { display: grid; grid-template-columns: minmax(0, 220px) minmax(0, 1fr); gap: 14px; }
+@media (max-width: 640px) { .panel .body { grid-template-columns: 1fr; } }
+.snap { position: relative; aspect-ratio: 16 / 9; background: var(--wash); border-radius: 8px; overflow: hidden; }
+.snap img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.snap span { position: absolute; inset: auto 6px 6px auto; font-size: 11px; color: #fff; background: rgba(0, 0, 0, .5); border-radius: 4px; padding: 0 5px; }
+.answers { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; align-content: start; }
+.answers li { display: grid; grid-template-columns: 14px 1fr auto; gap: 8px; align-items: start; }
+.key { width: 14px; height: 2px; border-radius: 1px; margin-top: 9px; }
+.answers .q { overflow-wrap: anywhere; }
+.answers .q small { display: block; color: var(--muted); font-size: 11px; }
+.pill { font-size: 12px; font-weight: 600; border-radius: 999px; padding: 1px 9px; white-space: nowrap; background: var(--wash); color: var(--ink-2); }
+.pill.yes { background: var(--critical-wash); color: var(--critical); }
+.pill.yes::before { content: "▲ "; font-size: 9px; vertical-align: 1px; }
+.stale { opacity: .55; }
+.chart { position: relative; margin-top: 12px; }
+.chart svg { display: block; width: 100%; overflow: visible; }
+.chart text { fill: var(--muted); font-size: 11px; }
+.gridline { stroke: var(--grid); stroke-width: 1; }
+.baseline { stroke: var(--axis); stroke-width: 1; }
+.ref { stroke: var(--ink-2); stroke-width: 1; opacity: .55; }
+.crosshair { stroke: var(--ink-2); stroke-width: 1; pointer-events: none; }
+details { margin-top: 10px; color: var(--ink-2); font-size: 13px; }
+summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+table { border-collapse: collapse; width: 100%; margin-top: 6px; font-size: 12px; }
+th, td { text-align: left; padding: 3px 6px; border-bottom: 1px solid var(--grid); font-variant-numeric: tabular-nums; }
+th { color: var(--muted); font-weight: 600; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--ink-2); font-size: 12px; margin-top: 6px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 50%; }
+.legend i.ring { background: none; border: 2px solid var(--muted); }
+.multiples { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+.mini h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.hsearch-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 6px; }
+.hsearch-row input { flex: 1 1 240px; min-width: 0; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--plane); }
+.hsearch-row button, .matches button { border: 1px solid var(--border); background: var(--plane); border-radius: 8px; padding: 5px 12px; cursor: pointer; color: var(--ink); }
+.hsearch-row button[type=submit] { background: var(--ink); color: var(--plane); border-color: var(--ink); }
+.matches { list-style: none; padding: 0; margin: 8px 0 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 10px; }
+.matches li { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.matches small { color: var(--muted); }
+.mthumb { aspect-ratio: 4 / 3; border-radius: 6px; background-color: var(--wash); background-repeat: no-repeat; border: 1px solid var(--border); }
+.mini .meta { color: var(--muted); font-size: 12px; }
+.empty { color: var(--muted); padding: 24px; text-align: center; background: var(--surface); border: 1px dashed var(--border); border-radius: 12px; }
+#tip { position: fixed; z-index: 20; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--border);
+       border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 6px 20px rgba(0, 0, 0, .14); max-width: 300px; display: none; }
+#tip .t { color: var(--muted); margin-bottom: 4px; }
+#tip .row { display: grid; grid-template-columns: 12px auto 1fr; gap: 6px; align-items: center; }
+#tip .row b { font-variant-numeric: tabular-nums; }
+#tip .row span:last-child { color: var(--ink-2); overflow-wrap: anywhere; }
+@media (max-width: 860px) {
+  .layout { grid-template-columns: 1fr; }
+  aside { position: static; max-height: none; }
+}
+</style>
+</head>
+<body>
+<div class="top">
+  <h1>Clef Operator</h1>
+  <span class="live" id="live"><i></i><span id="updated">connecting…</span></span>
+  <span class="spacer"></span>
+  <div class="seg" role="group" aria-label="Time range" id="range">
+    <button data-h="1">1 h</button><button data-h="6">6 h</button><button data-h="24">24 h</button>
+  </div>
+</div>
+<div class="layout">
+  <aside aria-label="Cameras">
+    <h2>Cameras</h2>
+    <input class="search" id="search" type="search" placeholder="Find a camera" aria-label="Find a camera">
+    <div class="quick"><button id="pick-active">With answers</button><button id="pick-all">All</button><button id="pick-none">None</button></div>
+    <ul class="cam-list" id="cams"></ul>
+  </aside>
+  <main>
+    <section class="tiles" id="tiles" aria-label="Summary"></section>
+    <section><h2>Selected cameras</h2><div class="panels" id="panels"></div></section>
+    <section><h2>Clef</h2><div class="panels" id="system"></div></section>
+  </main>
+</div>
+<div id="tip" role="status"></div>
+<script>
+"use strict";
+const TOKEN = new URLSearchParams(location.search).get("token");
+const SERIES = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"];
+const CLASSES = ["critical", "high", "normal", "low"];
+const NS = "http://www.w3.org/2000/svg";
+const state = { hours: 6, selected: new Set(), cameras: [], dash: null, history: {}, maps: {}, system: null, search: "",
+                hsearch: {} };  // hsearch: camera -> {q, result, busy, note}: plain-text search over its PTZ's map
+
+// ---------- small helpers ----------
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const api = (path, params = {}) => {
+  const q = new URLSearchParams(params);
+  if (TOKEN) q.set("token", TOKEN);
+  const s = q.toString();
+  return "v1/" + path + (s ? "?" + s : "");
+};
+async function getJSON(path, params) {
+  const r = await fetch(api(path, params), { cache: "no-store" });
+  if (!r.ok) throw new Error(path + ": HTTP " + r.status);
+  return r.json();
+}
+function el(tag, attrs = {}, ...children) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v; else if (k === "text") e.textContent = v;
+    else if (k.startsWith("on")) e.addEventListener(k.slice(2), v); else if (v !== null && v !== undefined) e.setAttribute(k, v);
+  }
+  for (const c of children.flat()) if (c !== null && c !== undefined) e.append(c);
+  return e;
+}
+function svg(tag, attrs = {}) {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) if (v !== null && v !== undefined) e.setAttribute(k, v);
+  return e;
+}
+const ago = s => s == null ? "–" : s < 60 ? Math.round(s) + " s ago" : s < 3600 ? Math.round(s / 60) + " min ago" : (s / 3600).toFixed(1) + " h ago";
+const pct = x => Math.round(x * 100) + "%";
+const clock = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+const clockS = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const seriesColor = i => css(SERIES[i % SERIES.length]);
+// Charts are drawn once their box is in the page, at its real width, so text stays its real size.
+const drawers = new WeakMap();
+function chartBox(draw, cls = "chart") { const box = el("div", { class: cls }); drawers.set(box, draw); return box; }
+function drawCharts(root) {
+  for (const box of root.querySelectorAll(".chart")) {
+    const draw = drawers.get(box);
+    if (!draw) continue;
+    const W = Math.max(260, Math.round(box.clientWidth || 600));
+    box.replaceChildren(...[].concat(draw(W)));
+  }
+}
+// The x domain: the selected range, or from the first data if there is less history than that (at least 10 min).
+function domain(times) {
+  const now = Date.now() / 1000, start = now - state.hours * 3600;
+  const first = times.length ? Math.min(...times) : now;
+  return [Math.max(start, Math.min(first, now - 600)), now];
+}
+
+// ---------- tooltip ----------
+const tip = document.getElementById("tip");
+function showTip(evt, title, rows) {
+  tip.replaceChildren(el("div", { class: "t", text: title }),
+    ...rows.map(r => el("div", { class: "row" },
+      el("i", { style: `display:block;width:12px;height:2px;border-radius:1px;background:${r.color || "transparent"}` }),
+      el("b", { text: r.value }), el("span", { text: r.label || "" }))));
+  tip.style.display = "block";
+  const w = tip.offsetWidth, h = tip.offsetHeight;
+  let x = evt.clientX + 14, y = evt.clientY + 14;
+  if (x + w > innerWidth - 8) x = evt.clientX - w - 14;
+  if (y + h > innerHeight - 8) y = evt.clientY - h - 14;
+  tip.style.left = x + "px"; tip.style.top = y + "px";
+}
+const hideTip = () => { tip.style.display = "none"; };
+
+// ---------- selection (URL hash, then this browser's memory) ----------
+function loadSelection() {
+  const h = new URLSearchParams(location.hash.slice(1));
+  if (h.get("range")) state.hours = Number(h.get("range")) || 6;
+  if (h.has("cams")) { state.selected = new Set(h.get("cams").split(",").filter(Boolean)); return true; }
+  try {
+    const saved = JSON.parse(localStorage.getItem("clef-dashboard") || "null");
+    if (saved) { state.selected = new Set(saved.cams || []); state.hours = saved.hours || state.hours; return true; }
+  } catch (e) { /* storage unavailable: fall back to the defaults */ }
+  return false;
+}
+function saveSelection() {
+  const h = new URLSearchParams({ cams: [...state.selected].join(","), range: String(state.hours) });
+  history.replaceState(null, "", "#" + h.toString());
+  try { localStorage.setItem("clef-dashboard", JSON.stringify({ cams: [...state.selected], hours: state.hours })); } catch (e) { /* ignore */ }
+}
+
+// ---------- camera list ----------
+function renderCameraList() {
+  const list = document.getElementById("cams");
+  const q = state.search.toLowerCase();
+  const shown = state.cameras.filter(c => !q || c.name.toLowerCase().includes(q));
+  const active = shown.filter(c => c.has_answers || c.hunter), rest = shown.filter(c => !(c.has_answers || c.hunter));
+  const item = c => {
+    const box = el("input", { type: "checkbox", "aria-label": c.name });
+    box.checked = state.selected.has(c.id);
+    box.addEventListener("change", () => { box.checked ? state.selected.add(c.id) : state.selected.delete(c.id); saveSelection(); refreshAll(); });
+    const badges = [];
+    if (c.yes) badges.push(el("span", { class: "badge yes", text: "▲ " + c.yes + " yes" }));
+    if (c.hunter) badges.push(el("span", { class: "badge ptz", text: "PTZ hunter" }));
+    const sub = c.has_answers ? "answered " + ago(c.age_s) : (c.status || "no answers yet").toLowerCase();
+    return el("li", {}, el("label", {}, box, el("span", { class: "name", text: c.name }), el("span", {}, badges),
+      el("span", { class: "sub", text: sub })));
+  };
+  list.replaceChildren(
+    ...(active.length ? [el("li", { class: "group", text: "With Clef answers" }), ...active.map(item)] : []),
+    ...(rest.length ? [el("li", { class: "group", text: "Other cameras" }), ...rest.map(item)] : []));
+}
+
+// ---------- summary tiles ----------
+function renderTiles() {
+  const d = state.dash, sys = state.system;
+  if (!d) return;
+  const minutes = (sys && sys.minutes) || [];
+  const answers = minutes.reduce((a, m) => a + m.answers, 0);
+  const late = minutes.reduce((a, m) => a + m.late, 0);
+  const busy = minutes.length ? minutes.reduce((a, m) => a + m.busy, 0) / minutes.length : 0;
+  const yes = d.cameras.reduce((a, c) => a + c.questions.filter(q => q.yes && q.age_s < 120).length, 0);
+  const tile = (label, value, note) => el("div", { class: "tile" }, el("div", { class: "label", text: label }),
+    el("div", { class: "value", text: value }), el("div", { class: "note", text: note }));
+  document.getElementById("tiles").replaceChildren(
+    tile("Clef", d.clef && d.clef.status === "ready" ? "Ready" : (d.clef && d.clef.status) || "?", (d.clef && d.clef.precision) || ""),
+    tile("Busy now", pct(d.busy_1m || 0), "average " + pct(busy) + (minutes.length && minutes.length < state.hours * 60 - 1 ? " since " + clock(minutes[0].t) : " over " + state.hours + " h")),
+    tile("Answered", answers.toLocaleString(), "windows in the last " + state.hours + " h"),
+    tile("On time", answers ? pct(1 - late / answers) : "–", late ? late + " late" : "none late"),
+    tile("Saying yes now", String(yes), yes ? "questions above their threshold" : "nothing alerting"));
+}
+
+// ---------- camera panels ----------
+function renderPanels() {
+  const host = document.getElementById("panels");
+  if (document.activeElement && document.activeElement.classList.contains("hsearch")) return; // typing a search
+  const ids = [...state.selected];
+  if (!ids.length) { host.replaceChildren(el("div", { class: "empty", text: "Pick cameras on the left to see their answers." })); return; }
+  const byId = Object.fromEntries((state.dash ? state.dash.cameras : []).map(c => [c.id, c]));
+  const names = Object.fromEntries(state.cameras.map(c => [c.id, c.name]));
+  host.replaceChildren(...ids.map(id => panel(id, byId[id], names[id] || (byId[id] && byId[id].name) || id.slice(0, 8))));
+  drawCharts(host);
+}
+
+function panel(id, cam, name) {
+  const hist = state.history[id];
+  const hunter = state.dash && state.dash.hunters ? state.dash.hunters[id] : null;
+  const qIndex = {}; // color follows the question, in the camera's own fixed order
+  (hist ? hist.questions : (cam ? cam.questions : [])).forEach((q, i) => { qIndex[q.id] = i; });
+  const meta = [];
+  if (cam) meta.push("answered " + ago(cam.age_s));
+  if (cam && cam.latency) meta.push("mean " + cam.latency.mean + " s to answer", pct(cam.latency.on_time) + " on time");
+  const img = el("img", { alt: "Latest frame from " + name, src: api("snapshot", { camera: id, t: Math.floor(Date.now() / 10000) }), loading: "lazy" });
+  img.addEventListener("error", () => { img.replaceWith(el("span", { text: "no image" })); });
+  const answers = el("ul", { class: "answers" }, cam ? cam.questions.map(q => {
+    const value = q.kind === "noul" ? (q.yes ? "YES " : "no ") + q.p.toFixed(2)
+      : (q.option ? (q.yes ? q.option.toUpperCase() : q.option) + " " + (q.option_p || 0).toFixed(2) : "–");
+    return el("li", { class: q.age_s > 120 ? "stale" : "" },
+      el("i", { class: "key", style: "background:" + seriesColor(qIndex[q.id] ?? 0) }),
+      el("span", { class: "q" }, (q.zone ? q.zone + ": " : "") + q.text,
+        el("small", { text: [q.priority, q.fps + " fps", q.latency_s != null ? q.latency_s + " s to answer" : null, ago(q.age_s)].filter(Boolean).join(" · ") })),
+      el("span", { class: "pill" + (q.yes ? " yes" : ""), text: value }));
+  }) : [el("li", { text: hunter ? "No video questions answered yet." : "No answers yet." })]);
+  const article = el("article", { class: "panel", "aria-label": name },
+    el("header", {}, el("h3", { text: name }), el("span", { class: "meta", text: meta.join(" · ") })),
+    el("div", { class: "body" }, el("div", { class: "snap" }, img, el("span", { text: "live" })), answers));
+  if (hist && hist.questions.length) {
+    article.append(timeline(hist, qIndex), historyTable(hist));
+  }
+  if (hunter) article.append(hunterMap(id));
+  return article;
+}
+
+// Probability of each question over the range, with yes runs as lanes underneath.
+function timeline(hist, qIndex) {
+  return chartBox(W => timelineSvg(W, hist, qIndex));
+}
+function timelineSvg(W, hist, qIndex) {
+  const plotH = 150, laneH = 12, lanes = hist.questions.length, pad = { l: 34, r: 10, t: 8, b: 22 };
+  const H = pad.t + plotH + 10 + lanes * (laneH + 4) + pad.b;
+  const [t0, now] = domain(hist.questions.flatMap(q => q.points.map(p => p[0])));
+  const x = t => pad.l + (t - t0) / (now - t0) * (W - pad.l - pad.r);
+  const y = p => pad.t + (1 - p) * plotH;
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "Answers over the last " + state.hours + " hours" });
+  for (const p of [0, 0.5, 1]) {
+    s.append(svg("line", { x1: pad.l, x2: W - pad.r, y1: y(p), y2: y(p), class: p === 0 ? "baseline" : "gridline" }));
+    const label = svg("text", { x: pad.l - 6, y: y(p) + 4, "text-anchor": "end" }); label.textContent = p.toFixed(1); s.append(label);
+  }
+  const ons = [...new Set(hist.questions.map(q => q.on))];
+  if (ons.length === 1) {
+    s.append(svg("line", { x1: pad.l, x2: W - pad.r, y1: y(ons[0]), y2: y(ons[0]), class: "ref" }));
+    const l = svg("text", { x: W - pad.r, y: y(ons[0]) - 4, "text-anchor": "end" }); l.textContent = "yes at " + ons[0]; s.append(l);
+  }
+  hist.questions.forEach(q => {
+    if (q.points.length < 2) return;
+    const d = q.points.map((pt, i) => (i ? "L" : "M") + x(pt[0]).toFixed(1) + " " + y(pt[1]).toFixed(1)).join(" ");
+    s.append(svg("path", { d, fill: "none", stroke: seriesColor(qIndex[q.id]), "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+  });
+  const laneTop = pad.t + plotH + 10;
+  hist.questions.forEach((q, i) => {
+    const top = laneTop + i * (laneH + 4);
+    s.append(svg("rect", { x: pad.l, y: top, width: W - pad.l - pad.r, height: laneH, rx: 3, fill: css("--wash") }));
+    for (const [a, b] of q.yes_spans) {
+      if (b < t0) continue;
+      const xa = Math.max(pad.l, x(a)), xb = Math.max(xa + 3, x(b));
+      s.append(svg("rect", { x: xa, y: top, width: xb - xa, height: laneH, rx: 3, fill: seriesColor(qIndex[q.id]) }));
+    }
+  });
+  const ticks = Math.max(2, Math.min(6, Math.floor((W - pad.l - pad.r) / 90)));
+  for (let i = 0; i <= ticks; i++) {
+    const t = t0 + (now - t0) * i / ticks;
+    const l = svg("text", { x: x(t), y: H - 6, "text-anchor": i === 0 ? "start" : i === ticks ? "end" : "middle" });
+    l.textContent = i === ticks ? "now" : clock(t); s.append(l);
+  }
+  const cross = svg("line", { y1: pad.t, y2: laneTop + lanes * (laneH + 4), class: "crosshair", visibility: "hidden" });
+  s.append(cross);
+  const hit = svg("rect", { x: pad.l, y: 0, width: W - pad.l - pad.r, height: H, fill: "transparent" });
+  hit.addEventListener("pointermove", evt => {
+    const r = s.getBoundingClientRect();
+    const px = (evt.clientX - r.left) / r.width * W;
+    const t = t0 + (px - pad.l) / (W - pad.l - pad.r) * (now - t0);
+    cross.setAttribute("x1", px); cross.setAttribute("x2", px); cross.setAttribute("visibility", "visible");
+    const rows = hist.questions.map(q => {
+      let best = null;
+      for (const pt of q.points) if (!best || Math.abs(pt[0] - t) < Math.abs(best[0] - t)) best = pt;
+      const near = best && Math.abs(best[0] - t) < Math.max(90, state.hours * 60);
+      return { color: seriesColor(qIndex[q.id]), value: near ? best[1].toFixed(2) + (best[1] >= q.on ? " yes" : "") : "–",
+               label: (q.zone ? q.zone + ": " : "") + q.text };
+    });
+    showTip(evt, clockS(t), rows);
+  });
+  hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); hideTip(); });
+  s.append(hit);
+  return s;
+}
+
+function historyTable(hist) {
+  const rows = [];
+  for (const q of hist.questions) for (const pt of q.points.slice(-12)) rows.push([pt[0], q, pt[1]]);
+  rows.sort((a, b) => b[0] - a[0]);
+  return el("details", {}, el("summary", { text: "Table of recent answers" }),
+    el("table", {}, el("thead", {}, el("tr", {}, el("th", { text: "Time" }), el("th", { text: "Question" }), el("th", { text: "P(yes)" }))),
+      el("tbody", {}, rows.slice(0, 40).map(([t, q, p]) => el("tr", {},
+        el("td", { text: clockS(t) }), el("td", { text: (q.zone ? q.zone + ": " : "") + q.text }),
+        el("td", { text: p.toFixed(2) + (p >= q.on ? " (yes)" : "") }))))));
+}
+
+// The PTZ hunter's learned views: where it looks, how promising each spot is, where it is now.
+function hunterMap(id) {
+  const m = state.maps[id];
+  if (!m || !m.views || !m.views.length) return el("div", { class: "meta", text: "Hunter map: waiting for views." });
+  const search = state.hsearch[id] || {};
+  return el("div", {}, hunterSearchForm(id, search), chartBox(W => hunterMapSvg(W, m, search.result)),
+    search.busy ? el("div", { class: "meta", text: "Searching…" }) : null,
+    search.note ? el("div", { class: "meta", text: search.note }) : null,
+    search.result ? searchMatches(id, search.result) : null);
+}
+
+// Plain-text search over what the PTZ has seen: every direction it has looked (each look's frame and its 9 tiles,
+// as EmbeddingGemma vectors) against the words typed. The map is then colored by match instead of by promise.
+function hunterSearchForm(id, search) {
+  const input = el("input", { type: "search", class: "hsearch", value: search.q || "", "aria-label": "Search what this PTZ has seen",
+                              placeholder: "Search what this PTZ has seen: picnic table, the gate, a parked car…" });
+  return el("form", { class: "hsearch-row", onsubmit: e => { e.preventDefault(); input.blur(); runSearch(id, input.value); } },
+    input, el("button", { type: "submit", text: "Search" }),
+    search.q ? el("button", { type: "button", text: "Clear", onclick: () => { delete state.hsearch[id]; renderPanels(); } }) : null);
+}
+async function runSearch(id, q) {
+  q = q.trim();
+  if (!q) return;
+  state.hsearch[id] = { q, busy: true };
+  renderPanels();
+  try { state.hsearch[id] = { q, result: await getJSON("hunter_search", { camera: id, q }) }; }
+  catch (e) { state.hsearch[id] = { q, note: "Search failed: is the embedding server running?" }; }
+  renderPanels();
+}
+function searchMatches(id, res) {
+  if (!res.top || !res.top.length) return el("div", { class: "meta", text: "Nothing in the map yet: it fills in as the hunter looks around." });
+  const now = Date.now() / 1000;
+  return el("ol", { class: "matches", "aria-label": "Best matches" }, res.top.map((r, i) => el("li", {},
+    matchThumb(id, r),
+    el("b", { text: `${i + 1}. similarity ${r.score.toFixed(3)}` }),
+    el("small", { text: `pan ${r.pan}° · tilt ${r.tilt}° · ${r.fov}° wide · seen ${ago(now - r.t)}` }),
+    el("button", { type: "button", text: "Look there", onclick: e => lookThere(id, r, e.currentTarget) }))));
+}
+function matchThumb(id, r) {  // the look's thumbnail, cropped to the tile that matched
+  const [x, y, w, h] = r.box;
+  const url = api("hunter_thumb", { camera: id, shot: r.shot });
+  return el("div", { class: "mthumb", role: "img", "aria-label": `What matched at pan ${r.pan}°, tilt ${r.tilt}°`,
+    style: `background-image:url('${url}');background-size:${100 / w}% ${100 / h}%;` +
+           `background-position:${w < 1 ? x / (1 - w) * 100 : 0}% ${h < 1 ? y / (1 - h) * 100 : 0}%` });
+}
+async function lookThere(id, r, button) {
+  button.disabled = true;
+  try {
+    const resp = await fetch(api("hunter_look"), { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ camera_id: id, pan: r.pan, tilt: r.tilt, fov: r.fov }) });
+    button.textContent = resp.ok ? "Going there next" : "Could not send it";
+  } catch (e) { button.textContent = "Could not send it"; }
+}
+function hunterMapSvg(W, m, found) {
+  const H = 230, pad = { l: 40, r: 12, t: 12, b: 26 };
+  const views = m.views;
+  const [pmin, pmax] = m.pan_range && m.pan_range[1] > m.pan_range[0] ? m.pan_range : [Math.min(...views.map(v => v.view.pan)), Math.max(...views.map(v => v.view.pan))];
+  const tilts = views.map(v => v.view.tilt);
+  const tmin = Math.min(-45, ...tilts) - 3, tmax = Math.max(5, ...tilts) + 3;
+  const x = p => pad.l + (p - (pmin - 10)) / ((pmax + 10) - (pmin - 10)) * (W - pad.l - pad.r);
+  const y = t => pad.t + (tmax - t) / (tmax - tmin) * (H - pad.t - pad.b);
+  const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": "PTZ hunter views by pan and tilt" });
+  for (const t of [0, -20, -40]) if (t >= tmin && t <= tmax) {
+    s.append(svg("line", { x1: pad.l, x2: W - pad.r, y1: y(t), y2: y(t), class: "gridline" }));
+    const l = svg("text", { x: pad.l - 6, y: y(t) + 4, "text-anchor": "end" }); l.textContent = t + "°"; s.append(l);
+  }
+  for (let p = Math.ceil(pmin / 45) * 45; p <= pmax; p += 45) {
+    const l = svg("text", { x: x(p), y: H - 8, "text-anchor": "middle" }); l.textContent = p + "°"; s.append(l);
+  }
+  const ramp = ["--q1", "--q2", "--q3", "--q4", "--q5"].map(css);
+  const radius = fov => fov >= 30 ? 8 : fov >= 14 ? 6 : 4.5;
+  const sorted = found && found.map && found.map.length ? [] : [...views].sort((a, b) => b.view.fov - a.view.fov); // wide first, zoomed spots on top
+  if (found && found.map && found.map.length) {
+    // Every embedded direction, colored by how well it matches the search (relative: the map's best to its worst).
+    const scores = found.map.map(e => e[3]), lo = Math.min(...scores), hi = Math.max(...scores);
+    const level = sc => Math.min(4, Math.floor((sc - lo) / Math.max(1e-6, hi - lo) * 5));
+    for (const [pan, tilt, fov, sc] of [...found.map].sort((a, b) => a[3] - b[3])) {
+      s.append(svg("circle", { cx: x(pan), cy: y(tilt), r: radius(fov) * 0.8, fill: ramp[level(sc)], "fill-opacity": 0.35 + 0.15 * level(sc) }));
+    }
+    found.top.forEach((r, i) => {
+      const cx = x(r.pan), cy = y(r.tilt);
+      s.append(svg("circle", { cx, cy, r: 9, fill: css("--surface"), stroke: css("--ink"), "stroke-width": 1.5 }));
+      const l = svg("text", { x: cx, y: cy + 4, "text-anchor": "middle", style: "fill:var(--ink);font-weight:600" });
+      l.textContent = String(i + 1); s.append(l);
+      const hit = svg("circle", { cx, cy, r: 12, fill: "transparent" });
+      hit.addEventListener("pointermove", evt => showTip(evt, `${i + 1}. pan ${r.pan}° · tilt ${r.tilt}° · ${r.fov}° wide`,
+        [{ value: r.score.toFixed(3), label: "similarity to “" + found.query + "”" }]));
+      hit.addEventListener("pointerleave", hideTip);
+      s.append(hit);
+    });
+  }
+  for (const v of sorted) {
+    const cx = x(v.view.pan), cy = y(v.view.tilt), r = radius(v.view.fov);
+    let mark;
+    if (v.avoid >= 0.8) {
+      mark = svg("path", { d: `M${cx - 4} ${cy - 4} L${cx + 4} ${cy + 4} M${cx + 4} ${cy - 4} L${cx - 4} ${cy + 4}`, stroke: css("--muted"), "stroke-width": 1.5 });
+    } else if (v.quiet) {
+      mark = svg("circle", { cx, cy, r, fill: "none", stroke: css("--muted"), "stroke-width": 2 });
+    } else {
+      const step = Math.min(4, Math.floor(v.yield * 5));
+      mark = svg("circle", { cx, cy, r, fill: ramp[step], stroke: css("--surface"), "stroke-width": 2 });
+    }
+    s.append(mark);
+    const hit = svg("circle", { cx, cy, r: 12, fill: "transparent" });
+    hit.addEventListener("pointermove", evt => showTip(evt, `pan ${v.view.pan}° · tilt ${v.view.tilt}° · ${v.view.fov}° wide`, [
+      { value: v.avoid >= 0.8 ? "avoided" : v.quiet ? "quiet" : pct(v.yield), label: v.avoid >= 0.8 ? "blocked view" : "promise vs the best view" },
+      { value: String(v.looks), label: "looks" },
+      ...(v.zoomed_for ? [{ value: "zoomed", label: v.zoomed_for }] : [])]));
+    hit.addEventListener("pointerleave", hideTip);
+    s.append(hit);
+  }
+  if (m.home) s.append(svg("path", { d: `M${x(m.home.pan)} ${y(m.home.tilt) - 7} l7 7 l-7 7 l-7 -7 z`, fill: "none", stroke: css("--ink-2"), "stroke-width": 1.5 }));
+  if (m.view) {
+    const cx = x(m.view.pan), cy = y(m.view.tilt);
+    s.append(svg("circle", { cx, cy, r: 13, fill: "none", stroke: css("--ink"), "stroke-width": 2 }));
+    s.append(svg("line", { x1: cx - 18, x2: cx - 13, y1: cy, y2: cy, stroke: css("--ink"), "stroke-width": 2 }));
+    s.append(svg("line", { x1: cx + 13, x2: cx + 18, y1: cy, y2: cy, stroke: css("--ink"), "stroke-width": 2 }));
+    const l = svg("text", { x: cx, y: cy - 18, "text-anchor": "middle", style: "fill:var(--ink);font-weight:600" });
+    l.textContent = m.state === "holding" ? "holding" : "now"; s.append(l);
+  }
+  if (found && found.map && found.map.length) {
+    return [el("div", { class: "mini" }, el("h4", { text: `Hunter map: “${found.query}”` }),
+      el("div", { class: "meta", text: `${found.entries} directions searched · numbers mark the best matches, one per spot` })), s,
+      el("div", { class: "legend" },
+        el("span", {}, el("i", { style: "background:" + ramp[4] }), "closest match"), el("span", {}, el("i", { style: "background:" + ramp[0] }), "least like it"),
+        el("span", { text: "◇ home" }), el("span", { text: "small dots: zoomed directions" }))];
+  }
+  return [el("div", { class: "mini" }, el("h4", { text: "Hunter map" }),
+    el("div", { class: "meta", text: (m.handed_over_s ? `handed over to an operator or the camera's tracking for ${m.handed_over_s} s more` : `${m.state} · ${m.mode}`) + ` · ${views.length} views learned · ${views.filter(v => v.quiet).length} quiet` + (m.embedded ? ` · ${m.embedded} directions embedded (search above)` : "") })), s,
+    el("div", { class: "legend" },
+      el("span", {}, el("i", { style: "background:" + ramp[4] }), "promising"), el("span", {}, el("i", { style: "background:" + ramp[0] }), "less so"),
+      el("span", {}, el("i", { class: "ring" }), "quiet"), el("span", { text: "× blocked" }), el("span", { text: "◇ home" }),
+      el("span", { text: "small dots: zoomed spots" }))];
+}
+
+// ---------- Clef / system ----------
+function renderSystem() {
+  const host = document.getElementById("system");
+  const sys = state.system;
+  if (!sys) return;
+  const minutes = sys.minutes;
+  const [t0, now] = domain(minutes.map(m => m.t));
+  const area = (title, meta, values, yMax, fmt, target, color, H = 150) => chartBox(W => areaSvg(W, H, title, meta, values, yMax, fmt, target, color), "mini chart");
+  const areaSvg = (W, H, title, meta, values, yMax, fmt, target, color) => {
+    const pad = { l: 38, r: 10, t: 10, b: 22 };
+    const x = t => pad.l + (t - t0) / (now - t0) * (W - pad.l - pad.r);
+    const y = v => pad.t + (1 - Math.min(v, yMax) / yMax) * (H - pad.t - pad.b);
+    const s = svg("svg", { viewBox: `0 0 ${W} ${H}`, role: "img", "aria-label": title });
+    for (const f of [0, 0.5, 1]) {
+      s.append(svg("line", { x1: pad.l, x2: W - pad.r, y1: y(yMax * f), y2: y(yMax * f), class: f === 0 ? "baseline" : "gridline" }));
+      const l = svg("text", { x: pad.l - 6, y: y(yMax * f) + 4, "text-anchor": "end" }); l.textContent = fmt(yMax * f); s.append(l);
+    }
+    const pts = values.filter(v => v[1] != null);
+    if (pts.length > 1) {
+      const line = pts.map((v, i) => (i ? "L" : "M") + x(v[0]).toFixed(1) + " " + y(v[1]).toFixed(1)).join(" ");
+      s.append(svg("path", { d: line + ` L${x(pts[pts.length - 1][0]).toFixed(1)} ${y(0)} L${x(pts[0][0]).toFixed(1)} ${y(0)} Z`, fill: color, opacity: 0.16 }));
+      s.append(svg("path", { d: line, fill: "none", stroke: color, "stroke-width": 2, "stroke-linejoin": "round" }));
+    }
+    if (target != null) {
+      s.append(svg("line", { x1: pad.l, x2: W - pad.r, y1: y(target), y2: y(target), class: "ref" }));
+      const l = svg("text", { x: W - pad.r, y: y(target) - 4, "text-anchor": "end" }); l.textContent = "target " + fmt(target); s.append(l);
+    }
+    for (const [i, label] of [[0, clock(t0)], [1, "now"]]) {
+      const l = svg("text", { x: i ? W - pad.r : pad.l, y: H - 6, "text-anchor": i ? "end" : "start" }); l.textContent = label; s.append(l);
+    }
+    const cross = svg("line", { y1: pad.t, y2: H - pad.b, class: "crosshair", visibility: "hidden" });
+    s.append(cross);
+    const hit = svg("rect", { x: pad.l, y: 0, width: W - pad.l - pad.r, height: H, fill: "transparent" });
+    hit.addEventListener("pointermove", evt => {
+      const r = s.getBoundingClientRect();
+      const px = (evt.clientX - r.left) / r.width * W;
+      const t = t0 + (px - pad.l) / (W - pad.l - pad.r) * (now - t0);
+      let best = null;
+      for (const v of values) if (!best || Math.abs(v[0] - t) < Math.abs(best[0] - t)) best = v;
+      if (!best) return;
+      cross.setAttribute("x1", x(best[0])); cross.setAttribute("x2", x(best[0])); cross.setAttribute("visibility", "visible");
+      showTip(evt, clock(best[0]), [{ color, value: best[1] == null ? "–" : fmt(best[1]), label: title }, ...(best[2] || [])]);
+    });
+    hit.addEventListener("pointerleave", () => { cross.setAttribute("visibility", "hidden"); hideTip(); });
+    s.append(hit);
+    return [el("h4", { text: title }), el("div", { class: "meta", text: meta }), s];
+  };
+  const avg = minutes.length ? minutes.reduce((a, m) => a + m.busy, 0) / minutes.length : 0;
+  const busy = area("Clef busy", "share of each minute spent answering · average " + pct(avg),
+    minutes.map(m => [m.t, m.busy, [{ value: String(m.answers), label: "answers" }, ...(m.lowered ? [{ value: String(m.lowered), label: "sent at a lower frame rate" }] : [])]]),
+    1, v => Math.round(v * 100) + "%", null, css("--s1"));
+  const minis = CLASSES.filter(c => minutes.some(m => m.latency[c])).map(c => {
+    const target = sys.targets[c];
+    const vals = minutes.map(m => [m.t, m.latency[c] ? m.latency[c].p95 : null,
+      m.latency[c] ? [{ value: m.latency[c].p50 + " s", label: "median" }] : []]);
+    const worst = Math.max(target || 1, ...vals.map(v => v[1] || 0));
+    return area(c[0].toUpperCase() + c.slice(1), "time to answer, 95th percentile per minute", vals, Math.ceil(worst * 1.2), v => v.toFixed(v < 10 ? 1 : 0) + " s", target, css("--s1"), 120);
+  });
+  const since = now - t0 < state.hours * 3600 - 60 ? "since " + clock(t0) + " (no earlier history)" : "last " + state.hours + " h";
+  host.replaceChildren(el("article", { class: "panel", style: "grid-column: 1 / -1" }, el("div", { class: "meta", text: since }), busy,
+    minis.length ? el("div", { class: "multiples", style: "margin-top:14px" }, minis) : el("div", { class: "meta", text: "No answers in this range yet." })));
+  drawCharts(host);
+}
+
+// ---------- refresh loops ----------
+function markLive(ok) {
+  document.getElementById("live").classList.toggle("off", !ok);
+  document.getElementById("updated").textContent = ok ? "live · " + new Date().toLocaleTimeString() : "gateway unreachable, retrying";
+}
+async function refreshDashboard() {
+  try { state.dash = await getJSON("dashboard"); markLive(true); renderTiles(); renderPanels(); } catch (e) { markLive(false); }
+}
+async function refreshCameras(first) {
+  try {
+    state.cameras = (await getJSON("cameras")).cameras;
+    if (first && !state.selected.size) {
+      state.cameras.filter(c => c.has_answers || c.hunter).forEach(c => state.selected.add(c.id));
+      saveSelection();
+    }
+    renderCameraList();
+  } catch (e) { markLive(false); }
+}
+async function refreshHistory() {
+  const ids = [...state.selected];
+  await Promise.all(ids.map(async id => {
+    try { state.history[id] = await getJSON("history", { camera: id, hours: state.hours }); } catch (e) { /* keep the last render */ }
+    if (state.cameras.find(c => c.id === id && c.hunter)) {
+      try { state.maps[id] = await getJSON("hunter_map", { camera: id }); } catch (e) { /* ignore */ }
+    }
+  }));
+  renderPanels();
+}
+async function refreshSystem() {
+  try { state.system = await getJSON("system_history", { hours: state.hours }); renderSystem(); renderTiles(); } catch (e) { /* ignore */ }
+}
+function refreshAll() { renderCameraList(); refreshDashboard(); refreshHistory(); refreshSystem(); }
+
+document.getElementById("search").addEventListener("input", e => { state.search = e.target.value; renderCameraList(); });
+document.getElementById("pick-active").addEventListener("click", () => {
+  state.selected = new Set(state.cameras.filter(c => c.has_answers || c.hunter).map(c => c.id)); saveSelection(); refreshAll();
+});
+document.getElementById("pick-all").addEventListener("click", () => { state.selected = new Set(state.cameras.map(c => c.id)); saveSelection(); refreshAll(); });
+document.getElementById("pick-none").addEventListener("click", () => { state.selected = new Set(); saveSelection(); refreshAll(); });
+for (const b of document.querySelectorAll("#range button")) {
+  b.addEventListener("click", () => { state.hours = Number(b.dataset.h); saveSelection(); markRange(); refreshHistory(); refreshSystem(); });
+}
+function markRange() { for (const b of document.querySelectorAll("#range button")) b.setAttribute("aria-pressed", String(Number(b.dataset.h) === state.hours)); }
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { renderPanels(); renderSystem(); });
+let resizeTimer = 0;
+addEventListener("resize", () => { clearTimeout(resizeTimer); resizeTimer = setTimeout(() => { drawCharts(document.body); }, 200); });
+
+loadSelection();
+markRange();
+refreshCameras(true).then(() => { refreshDashboard(); refreshHistory(); refreshSystem(); });
+setInterval(refreshDashboard, 3000);
+setInterval(refreshHistory, 15000);
+setInterval(refreshSystem, 30000);
+setInterval(() => refreshCameras(false), 60000);
+</script>
+</body>
+</html>

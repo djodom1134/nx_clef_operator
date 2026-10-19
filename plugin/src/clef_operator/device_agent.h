@@ -55,14 +55,6 @@ private:
         nx::sdk::Uuid trackId; //< The object track that carries the event's thumbnail.
     };
     void emitClosed(const OpenEvent& open, const std::string& reason);
-    /** The latest answer to every question, small in the lower right of the video (called about once a second). */
-    void pushAnswers(int64_t timestampUs);
-    struct AnswerLine
-    {
-        std::string label;
-        std::string text;
-        int64_t windowEndUs = 0;
-    };
     void emitHealth(const std::string& caption, const std::string& description);
 
     void runTasks();
@@ -79,9 +71,6 @@ private:
     int64_t m_lastMotionUs = 0;
     int64_t m_lastOnsetUs = 0;
     std::atomic<int64_t> m_lastFrameUs{0};
-    int64_t m_lastAnswersUs = 0;
-    std::string m_lastAnswersTitle;
-    const nx::sdk::Uuid m_answersTrackId; //< one track per camera for the answers shown on the video
 
     // Guarded by m_mutex.
     std::mutex m_mutex;
@@ -89,7 +78,6 @@ private:
     std::map<std::string, EventState> m_events; //< by question id
     std::set<std::string> m_liveQuestions; //< ids of the questions currently configured
     std::map<std::string, OpenEvent> m_openEvents; //< by question id, while its event is open
-    std::map<std::string, AnswerLine> m_answers; //< by question id: the latest answer, for the video overlay
     int64_t m_lastHealthUs = 0;
     bool m_hunterWasEnabled = false;
 

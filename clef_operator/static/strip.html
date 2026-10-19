@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clef status</title>
+<style>
+/* One camera's Clef answers, small enough to sit beside its tile in an Nx layout: a row per question (yes or no
+   against its threshold, the probability, how old) and its probability over the last hour. Same tokens as the
+   dashboard. Dark like Nx's client; ?theme=light for a light one. */
+:root {
+  color-scheme: dark;
+  --plane: #0d0d0d; --surface: #1a1a19; --ink: #f0efec; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10); --wash: rgba(255, 255, 255, 0.05);
+  --line: #3987e5; --critical: #e66767; --critical-wash: rgba(208, 59, 59, 0.28); --good: #0ca30c;
+}
+:root[data-theme="light"] {
+  color-scheme: light;
+  --plane: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11, 11, 11, 0.10); --wash: rgba(11, 11, 11, 0.04);
+  --line: #2a78d6; --critical: #d03b3b; --critical-wash: rgba(208, 59, 59, 0.14);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; background: var(--plane); color: var(--ink); overflow: hidden; }
+body { font: clamp(11px, 2.4vw, 15px)/1.3 system-ui, -apple-system, "Segoe UI", sans-serif;
+       display: flex; flex-direction: column; padding: .6em .8em; gap: .45em; }
+a { color: var(--line); }
+.head { display: flex; align-items: baseline; gap: .6em; min-width: 0; }
+.head h1 { font-size: 1.05em; margin: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.head .meta { margin-left: auto; color: var(--muted); font-size: .85em; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.stale { color: var(--critical); }
+#rows { flex: 1; min-height: 0; display: flex; flex-direction: column; gap: .4em; overflow: hidden; }
+.q { flex: 1 1 0; min-height: 2.6em; display: grid; grid-template-columns: auto 1fr auto; grid-template-rows: auto 1fr;
+     column-gap: .55em; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: .35em .55em; }
+.q.yes { border-color: var(--critical); box-shadow: inset 3px 0 0 var(--critical); }
+.chip { align-self: center; font-weight: 650; font-size: .8em; letter-spacing: .04em; padding: .1em .45em; border-radius: 4px;
+        border: 1px solid var(--border); color: var(--ink-2); white-space: nowrap; }
+.q.yes .chip { color: var(--critical); border-color: var(--critical); }
+.text { align-self: center; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.text small { color: var(--muted); }
+.val { align-self: center; text-align: right; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.val b { font-weight: 650; }
+.val span { color: var(--muted); font-size: .85em; }
+.spark { grid-column: 1 / -1; position: relative; min-height: 1.4em; margin-top: .2em; }
+body.nx .spark { cursor: pointer; }
+.spark .none { position: absolute; left: 0; bottom: .1em; color: var(--muted); font-size: .8em; }
+.spark svg { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+.tip { position: fixed; pointer-events: none; z-index: 9; background: var(--surface); color: var(--ink);
+       border: 1px solid var(--border); border-radius: 4px; padding: .2em .45em; font-size: .85em; white-space: nowrap;
+       font-variant-numeric: tabular-nums; display: none; }
+.foot { display: flex; gap: .8em; color: var(--muted); font-size: .8em; white-space: nowrap; overflow: hidden; }
+.foot .axis { margin-left: auto; }
+.hs { display: none; gap: .4em; }
+.hs.on { display: flex; }
+.hs input { flex: 1; min-width: 0; font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 5px; padding: .2em .5em; }
+.hs button, .hres button { font: inherit; font-size: .85em; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 5px; padding: .15em .6em; cursor: pointer; }
+.hres { display: flex; gap: .45em; }
+.hres:empty { display: none; }
+.hres figure { flex: 1 1 0; min-width: 0; margin: 0; display: flex; flex-direction: column; gap: .2em; font-size: .8em; color: var(--muted); }
+.hres .th { aspect-ratio: 4 / 3; max-height: 18vh; border-radius: 4px; background-repeat: no-repeat; background-color: var(--wash); }
+.pick { overflow: auto; }
+.pick a { display: block; padding: .3em 0; }
+.empty { color: var(--muted); margin: auto; text-align: center; }
+</style>
+</head>
+<body>
+<div class="head"><h1 id="name">Clef</h1><span class="meta" id="meta"></span></div>
+<div id="rows"></div>
+<form class="hs" id="hs"><input id="hq" type="search" placeholder="Search what this PTZ has seen…" aria-label="Search what this PTZ has seen"><button type="submit">Search</button></form>
+<div class="hres" id="hres" aria-label="Best matches"></div>
+<div class="foot"><span id="foot"></span><span class="axis" id="axis"></span></div>
+<div class="tip" id="tip"></div>
+<script>
+"use strict";
+const params = new URLSearchParams(location.search);
+const TOKEN = params.get("token"), CAMERA = params.get("camera");
+const HOURS = Math.min(24, Math.max(0.25, parseFloat(params.get("hours")) || 1));
+if (params.get("theme")) document.documentElement.dataset.theme = params.get("theme");
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+let latest = null, history = null, note = "";
+
+// Nx Desktop Client JavaScript API (the Web Page needs "Allow using Client API"): the client builds window.vms over
+// Qt WebChannel, then calls window.vmsApiInit. Clicking a graph moves this camera's tile on the open layout to then.
+let nxReady = false;
+window.vmsApiInit = () => { nxReady = !!(window.vms && vms.tab); document.body.classList.toggle("nx", nxReady); };
+function nxCall(fn, ...args) {  // WebChannel methods answer through a callback, or a promise when given none
+  return new Promise((resolve, reject) => {
+    try {
+      const r = fn(...args, resolve);
+      if (r && typeof r.then === "function") r.then(resolve, reject);
+    } catch (e) { reject(e); }
+  });
+}
+const idOf = v => String(v || "").replace(/[{}]/g, "").toLowerCase();
+async function jumpTo(t) {
+  if (!nxReady) { flash("open this page in the Nx client to jump to a time"); return; }
+  const params = { media: { timestampMs: Math.round(t * 1000), speed: 1 } };
+  try {
+    const state = await nxCall(vms.tab.state.bind(vms.tab));
+    const items = ((state && state.items) || []).filter(it => idOf(it.resource && it.resource.id) === idOf(CAMERA));
+    if (items.length) {
+      for (const it of items) await nxCall(vms.tab.setItemParams.bind(vms.tab), it.id, params);
+    } else {
+      await nxCall(vms.tab.addItem.bind(vms.tab), idOf(CAMERA), params);
+    }
+    flash(`playing from ${new Date(t * 1000).toLocaleTimeString()}`);
+  } catch (e) {
+    flash(`could not move the timeline: ${e && e.message || e}`);
+  }
+}
+// PTZ cameras: plain-text search over what the hunter has seen (its embedding map), best three with "Look there".
+async function searchMap(q) {
+  q = q.trim();
+  if (!q) { $("hres").replaceChildren(); return; }
+  let res;
+  try { res = await api("/v1/hunter_search", { camera: CAMERA, q }); } catch (e) { flash("search failed: is the embedding server running?"); return; }
+  const now = Date.now() / 1000, keep = TOKEN ? `&token=${encodeURIComponent(TOKEN)}` : "";
+  $("hres").innerHTML = (res.top || []).slice(0, 3).map((r, i) => {
+    const [x, y, w, h] = r.box;
+    const url = `/v1/hunter_thumb?camera=${encodeURIComponent(CAMERA)}&shot=${r.shot}${keep}`;
+    return `<figure><div class="th" style="background-image:url('${url}');background-size:${100 / w}% ${100 / h}%;` +
+      `background-position:${w < 1 ? x / (1 - w) * 100 : 0}% ${h < 1 ? y / (1 - h) * 100 : 0}%"></div>` +
+      `<span>${i + 1}. ${r.score.toFixed(3)} · pan ${r.pan}° tilt ${r.tilt}° · ${ago(now - r.t)}</span>` +
+      `<button type="button" data-i="${i}">Look there</button></figure>`;
+  }).join("") || `<span class="none">nothing in the map yet</span>`;
+  for (const b of $("hres").querySelectorAll("button")) {
+    const r = res.top[+b.dataset.i];
+    b.onclick = async () => {
+      b.disabled = true;
+      const q2 = new URLSearchParams(TOKEN ? { token: TOKEN } : {});
+      const resp = await fetch(`/v1/hunter_look?${q2}`, { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ camera_id: CAMERA, pan: r.pan, tilt: r.tilt, fov: r.fov }) }).catch(() => null);
+      b.textContent = resp && resp.ok ? "going there next" : "could not send it";
+    };
+  }
+}
+$("hs").onsubmit = e => { e.preventDefault(); searchMap($("hq").value); };
+
+function flash(text) { note = text; render(); setTimeout(() => { if (note === text) { note = ""; render(); } }, 6000); }
+
+function api(path, extra = {}) {
+  const q = new URLSearchParams(extra);
+  if (TOKEN) q.set("token", TOKEN);
+  return fetch(`${path}?${q}`, { cache: "no-store" }).then(r => { if (!r.ok) throw new Error(r.status); return r.json(); });
+}
+function ago(s) {
+  if (s == null) return "";
+  if (s < 90) return `${Math.round(s)} s ago`;
+  if (s < 5400) return `${Math.round(s / 60)} min ago`;
+  return `${(s / 3600).toFixed(1)} h ago`;
+}
+const clock = t => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+
+async function pickCamera() {  // no ?camera=: list the cameras with answers, each a link to its strip
+  $("name").textContent = "Clef status: pick a camera";
+  const { cameras } = await api("/v1/cameras");
+  const keep = TOKEN ? `&token=${encodeURIComponent(TOKEN)}` : "";
+  const list = cameras.filter(c => c.has_answers);
+  $("rows").className = "pick";
+  $("rows").innerHTML = list.length
+    ? list.map(c => `<a href="?camera=${c.id}${keep}">${esc(c.name)}</a>`).join("")
+    : `<div class="empty">No camera has Clef answers yet.</div>`;
+}
+
+async function refresh() {
+  try {
+    latest = await api("/v1/dashboard", { cameras: CAMERA });
+  } catch (e) {
+    $("meta").innerHTML = `<span class="stale">gateway unreachable</span>`;
+    return;
+  }
+  render();
+}
+async function refreshHistory() {
+  try { history = await api("/v1/history", { camera: CAMERA, hours: HOURS }); } catch (e) { return; }
+  render();
+}
+
+function render() {
+  const cam = latest && latest.cameras.find(c => c.id === CAMERA.replace(/[{}]/g, ""));
+  if (!cam) {
+    $("rows").innerHTML = `<div class="empty">No Clef answers for this camera yet.</div>`;
+    return;
+  }
+  $("name").textContent = cam.name;
+  document.title = `Clef · ${cam.name}`;
+  const stale = cam.age_s > 120;
+  $("meta").innerHTML = stale ? `<span class="stale">no answers for ${ago(cam.age_s).replace(" ago", "")}</span>` : ago(cam.age_s);
+  const series = {};
+  for (const q of (history && history.questions) || []) series[q.id] = q;
+  $("rows").innerHTML = cam.questions.map((q, i) => {
+    const label = q.option ? `${esc(q.option)} ${Math.round(q.option_p * 100)}%` : "";
+    return `<div class="q${q.yes ? " yes" : ""}">
+      <span class="chip">${q.yes ? "▲ YES" : "no"}</span>
+      <span class="text" title="${esc(q.text)}">${q.zone ? `<small>${esc(q.zone)} · </small>` : ""}${esc(q.text)}</span>
+      <span class="val">${label ? `<span>${label}</span> ` : ""}<b>${q.p.toFixed(2)}</b> <span>/ ${q.on.toFixed(2)}</span></span>
+      <div class="spark" data-i="${i}" data-q="${esc(q.id)}"></div></div>`;
+  }).join("");
+  const hunter = latest.hunters && latest.hunters[cam.id];
+  $("hs").classList.toggle("on", !!hunter);
+  $("foot").textContent = note || [hunter ? `PTZ ${hunter.state}${hunter.mode && hunter.state === "hunting" ? `, ${hunter.mode}` : ""}` : "",
+                           cam.questions.length ? `answered in ${cam.questions[0].latency_s ?? "-"} s` : ""].filter(Boolean).join(" · ");
+  $("axis").textContent = `last ${HOURS < 1 ? `${HOURS * 60} min` : `${HOURS} h`} · now ${clock(latest.generated_at)}`;
+  for (const el of document.querySelectorAll(".spark")) draw(el, series[el.dataset.q], cam.questions[+el.dataset.i]);
+}
+
+function draw(el, s, q) {
+  const w = el.clientWidth, h = el.clientHeight;
+  if (w < 20 || h < 8) return;
+  const end = latest.generated_at, start = end - HOURS * 3600;
+  const x = t => (t - start) / (end - start) * w, y = p => h - 1 - p * (h - 2);
+  let svg = `<svg viewBox="0 0 ${w} ${h}" role="img" aria-label="${esc(q.text)}: probability over time">`;
+  for (const [a, b] of (s && s.yes_spans) || [])  // yes runs as a wash behind the line
+    if (b > start) svg += `<rect x="${x(Math.max(a, start))}" y="0" width="${Math.max(2, x(b) - x(Math.max(a, start)))}" height="${h}" fill="var(--critical-wash)"/>`;
+  svg += `<line x1="0" x2="${w}" y1="${h - .5}" y2="${h - .5}" stroke="var(--axis)"/>`;
+  svg += `<line x1="0" x2="${w}" y1="${y(q.on)}" y2="${y(q.on)}" stroke="var(--muted)" stroke-dasharray="3 3"/>`;
+  const pts = ((s && s.points) || []).filter(p => p[0] >= start);
+  if (pts.length) {
+    // A gap of over 3 minutes (no windows: no motion, or the PTZ moving) breaks the line instead of bridging it.
+    const d = pts.map((p, i) => `${i && p[0] - pts[i - 1][0] <= 180 ? "L" : "M"}${x(p[0]).toFixed(1)},${y(p[1]).toFixed(1)}`).join("");
+    svg += `<path d="${d}" fill="none" stroke="var(--line)" stroke-width="1.5" stroke-linejoin="round"/>`;
+    pts.forEach((p, i) => {  // an answer with gaps on both sides is a dot
+      const alone = (!i || p[0] - pts[i - 1][0] > 180) && (i === pts.length - 1 || pts[i + 1][0] - p[0] > 180);
+      if (alone) svg += `<circle cx="${x(p[0])}" cy="${y(p[1])}" r="1.8" fill="var(--line)"/>`;
+    });
+    const last = pts[pts.length - 1];
+    svg += `<circle cx="${x(last[0])}" cy="${y(last[1])}" r="2.5" fill="var(--line)" stroke="var(--surface)" stroke-width="1.5"/>`;
+  }
+  svg += `<line class="cross" x1="0" x2="0" y1="0" y2="${h}" stroke="var(--ink-2)" visibility="hidden"/></svg>`;
+  el.innerHTML = svg + (pts.length ? "" : `<span class="none">no answers in this time</span>`);
+  el.onmousemove = ev => {
+    if (!pts.length) return;
+    const rect = el.getBoundingClientRect(), t = start + (ev.clientX - rect.left) / w * (end - start);
+    const near = pts.reduce((a, b) => Math.abs(b[0] - t) < Math.abs(a[0] - t) ? b : a);
+    const cross = el.querySelector(".cross");
+    cross.setAttribute("x1", x(near[0])); cross.setAttribute("x2", x(near[0])); cross.setAttribute("visibility", "visible");
+    const tip = $("tip");
+    tip.textContent = `${clock(near[0])}  p ${near[1].toFixed(2)}${near[1] >= q.on ? "  yes" : ""}${nxReady ? "  · click to play" : ""}`;
+    tip.style.display = "block";
+    tip.style.left = `${Math.min(ev.clientX + 10, innerWidth - tip.offsetWidth - 4)}px`;
+    tip.style.top = `${rect.top - tip.offsetHeight - 4}px`;
+  };
+  el.onclick = ev => {  // jump to the start of the answered window nearest the click (a window is the 30 s before it)
+    const rect = el.getBoundingClientRect(), t = start + (ev.clientX - rect.left) / w * (end - start);
+    const near = pts.length ? pts.reduce((a, b) => Math.abs(b[0] - t) < Math.abs(a[0] - t) ? b : a) : null;
+    jumpTo(near && Math.abs(near[0] - t) <= 120 ? near[0] - 30 : t);
+  };
+  el.onmouseleave = () => { $("tip").style.display = "none"; el.querySelector(".cross").setAttribute("visibility", "hidden"); };
+}
+
+if (window.vms && vms.tab) window.vmsApiInit();  // the client got there first
+if (!CAMERA) {
+  pickCamera();
+} else {
+  refresh(); refreshHistory();
+  setInterval(refresh, 3000);
+  setInterval(refreshHistory, 30000);
+  addEventListener("resize", render);
+}
+</script>
+</body>
+</html>
