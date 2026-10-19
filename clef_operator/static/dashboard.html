@@ -106,6 +106,13 @@ th { color: var(--muted); font-weight: 600; }
 .legend i.ring { background: none; border: 2px solid var(--muted); }
 .multiples { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
 .mini h4 { margin: 0; font-size: 13px; font-weight: 600; }
+.hunter-head { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; margin-top: 14px; }
+.hunter-head h4 { margin: 0 6px 0 0; font-size: 14px; }
+.chips { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; font-size: 12px; color: var(--muted); }
+.chips b { font-weight: 600; color: var(--ink-2); margin-left: 4px; }
+.chips span { border: 1px solid var(--border); border-radius: 999px; padding: 1px 8px; color: var(--ink); background: var(--plane); }
+.chips span.away { color: var(--ink-2); text-decoration: line-through; text-decoration-color: var(--muted); }
+.hunter-head .seg { margin-left: auto; }
 .hsearch-row { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 6px; }
 .hsearch-row input { flex: 1 1 240px; min-width: 0; padding: 6px 10px; border: 1px solid var(--border); border-radius: 8px; background: var(--plane); }
 .hsearch-row button, .matches button { border: 1px solid var(--border); background: var(--plane); border-radius: 8px; padding: 5px 12px; cursor: pointer; color: var(--ink); }
@@ -158,7 +165,9 @@ const SERIES = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6", "--s7", "--s8"];
 const CLASSES = ["critical", "high", "normal", "low"];
 const NS = "http://www.w3.org/2000/svg";
 const state = { hours: 6, selected: new Set(), cameras: [], dash: null, history: {}, maps: {}, system: null, search: "",
-                hsearch: {} };  // hsearch: camera -> {q, result, busy, note}: plain-text search over its PTZ's map
+                hsearch: {},  // camera -> {q, result, busy, note}: someone's own search over its PTZ's embedding map
+                hown: {},     // camera -> that map searched for what the hunter looks for (refreshed with the history)
+                hview: {} };  // camera -> "like" (embedding map, the default) | "found" (what Clef's answers found)
 
 // ---------- small helpers ----------
 const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
@@ -400,28 +409,46 @@ function historyTable(hist) {
 }
 
 // The PTZ hunter's learned views: where it looks, how promising each spot is, where it is now.
+// The PTZ hunter, by what it looks for: its descriptions, and a map of every direction it has looked, colored by how
+// much it looks like them (EmbeddingGemma), with the best matches. "Found so far" is the older view: what Clef's
+// answers have shown at each learned view.
 function hunterMap(id) {
   const m = state.maps[id];
-  if (!m || !m.views || !m.views.length) return el("div", { class: "meta", text: "Hunter map: waiting for views." });
+  if (!m || !m.views || !m.views.length) return el("div", { class: "meta", text: "PTZ hunter: waiting for views." });
   const search = state.hsearch[id] || {};
-  return el("div", {}, hunterSearchForm(id, search), chartBox(W => hunterMapSvg(W, m, search.result)),
+  const own = state.hown[id];
+  const found = search.result || (own && own.map && own.map.length ? own : null);
+  const mode = state.hview[id] || (found ? "like" : "found");
+  const chips = (label, items, cls) => items && items.length
+    ? [el("b", { text: label }), ...items.map(t => el("span", { class: cls || "", text: t }))] : [];
+  const seg = el("div", { class: "seg", role: "group", "aria-label": "Hunter map view" },
+    ...[["like", "Looks like"], ["found", "Found so far"]].map(([key, text]) => el("button", {
+      type: "button", text, "aria-pressed": String(mode === key), onclick: () => { state.hview[id] = key; renderPanels(); } })));
+  return el("div", {},
+    el("div", { class: "hunter-head" }, el("h4", { text: "PTZ hunter" }),
+      el("div", { class: "chips" }, ...chips("Look for", m.look_for), ...chips("Look closer at", m.look_closer),
+        ...chips("Stay away from", m.stay_away, "away")), seg),
+    hunterSearchForm(id, search),
+    mode === "like" && found ? chartBox(W => hunterMapSvg(W, m, found)) : chartBox(W => hunterMapSvg(W, m, null)),
     search.busy ? el("div", { class: "meta", text: "Searching…" }) : null,
     search.note ? el("div", { class: "meta", text: search.note }) : null,
-    search.result ? searchMatches(id, search.result) : null);
+    mode === "like" && found ? searchMatches(id, found) : null,
+    mode === "like" && !found ? el("div", { class: "meta", text: "The embedding map fills in as the hunter looks around (or the embedding server is down): showing what Clef has found so far." }) : null);
 }
 
 // Plain-text search over what the PTZ has seen: every direction it has looked (each look's frame and its 9 tiles,
 // as EmbeddingGemma vectors) against the words typed. The map is then colored by match instead of by promise.
 function hunterSearchForm(id, search) {
   const input = el("input", { type: "search", class: "hsearch", value: search.q || "", "aria-label": "Search what this PTZ has seen",
-                              placeholder: "Search what this PTZ has seen: picnic table, the gate, a parked car…" });
+                              placeholder: "Search for anything else it has seen: picnic table, the gate, a parked car…" });
   return el("form", { class: "hsearch-row", onsubmit: e => { e.preventDefault(); input.blur(); runSearch(id, input.value); } },
     input, el("button", { type: "submit", text: "Search" }),
-    search.q ? el("button", { type: "button", text: "Clear", onclick: () => { delete state.hsearch[id]; renderPanels(); } }) : null);
+    search.q ? el("button", { type: "button", text: "Back to what it looks for", onclick: () => { delete state.hsearch[id]; renderPanels(); } }) : null);
 }
 async function runSearch(id, q) {
   q = q.trim();
   if (!q) return;
+  state.hview[id] = "like";
   state.hsearch[id] = { q, busy: true };
   renderPanels();
   try { state.hsearch[id] = { q, result: await getJSON("hunter_search", { camera: id, q }) }; }
@@ -431,11 +458,13 @@ async function runSearch(id, q) {
 function searchMatches(id, res) {
   if (!res.top || !res.top.length) return el("div", { class: "meta", text: "Nothing in the map yet: it fills in as the hunter looks around." });
   const now = Date.now() / 1000;
-  return el("ol", { class: "matches", "aria-label": "Best matches" }, res.top.map((r, i) => el("li", {},
+  return el("div", {}, el("div", { class: "mini" }, el("h4", { text: res.own ? "Where it is most worth looking" : `Best matches for “${res.query}”` }),
+      res.own ? el("div", { class: "meta", text: "Most like what it looks for and where it looks closer, least like what it stays away from (and walls, roofs, sky)" }) : null),
+    el("ol", { class: "matches", "aria-label": "Best matches" }, res.top.map((r, i) => el("li", {},
     matchThumb(id, r),
-    el("b", { text: `${i + 1}. similarity ${r.score.toFixed(3)}` }),
+    el("b", { text: res.own ? `${i + 1}. match ${r.score >= 0 ? "+" : ""}${r.score.toFixed(3)}` : `${i + 1}. similarity ${r.score.toFixed(3)}` }),
     el("small", { text: `pan ${r.pan}° · tilt ${r.tilt}° · ${r.fov}° wide · seen ${ago(now - r.t)}` }),
-    el("button", { type: "button", text: "Look there", onclick: e => lookThere(id, r, e.currentTarget) }))));
+    el("button", { type: "button", text: "Look there", onclick: e => lookThere(id, r, e.currentTarget) })))));
 }
 function matchThumb(id, r) {  // the look's thumbnail, cropped to the tile that matched
   const [x, y, w, h] = r.box;
@@ -520,13 +549,14 @@ function hunterMapSvg(W, m, found) {
     l.textContent = m.state === "holding" ? "holding" : "now"; s.append(l);
   }
   if (found && found.map && found.map.length) {
-    return [el("div", { class: "mini" }, el("h4", { text: `Hunter map: “${found.query}”` }),
-      el("div", { class: "meta", text: `${found.entries} directions searched · numbers mark the best matches, one per spot` })), s,
+    return [el("div", { class: "mini" }, el("h4", { text: found.own ? `Worth looking: like ${found.query}, the places to look closer, not ${(found.versus || []).join(", ") || "walls or sky"}` : `Looks like “${found.query}”` }),
+      el("div", { class: "meta", text: (m.handed_over_s ? `handed over to an operator or the camera's tracking for ${m.handed_over_s} s more` : `${m.state} · ${m.mode}`) +
+        ` · ${found.entries} directions seen · numbers mark the best matches, one per spot` })), s,
       el("div", { class: "legend" },
         el("span", {}, el("i", { style: "background:" + ramp[4] }), "closest match"), el("span", {}, el("i", { style: "background:" + ramp[0] }), "least like it"),
         el("span", { text: "◇ home" }), el("span", { text: "small dots: zoomed directions" }))];
   }
-  return [el("div", { class: "mini" }, el("h4", { text: "Hunter map" }),
+  return [el("div", { class: "mini" }, el("h4", { text: "Found so far (Clef's answers at each learned view)" }),
     el("div", { class: "meta", text: (m.handed_over_s ? `handed over to an operator or the camera's tracking for ${m.handed_over_s} s more` : `${m.state} · ${m.mode}`) + ` · ${views.length} views learned · ${views.filter(v => v.quiet).length} quiet` + (m.embedded ? ` · ${m.embedded} directions embedded (search above)` : "") })), s,
     el("div", { class: "legend" },
       el("span", {}, el("i", { style: "background:" + ramp[4] }), "promising"), el("span", {}, el("i", { style: "background:" + ramp[0] }), "less so"),
@@ -622,6 +652,7 @@ async function refreshHistory() {
     try { state.history[id] = await getJSON("history", { camera: id, hours: state.hours }); } catch (e) { /* keep the last render */ }
     if (state.cameras.find(c => c.id === id && c.hunter)) {
       try { state.maps[id] = await getJSON("hunter_map", { camera: id }); } catch (e) { /* ignore */ }
+      try { state.hown[id] = await getJSON("hunter_search", { camera: id }); } catch (e) { /* the embedder may be down */ }
     }
   }));
   renderPanels();

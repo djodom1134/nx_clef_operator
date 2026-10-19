@@ -4,7 +4,7 @@ import time
 import pytest
 
 from clef_operator.hunter import (
-    CUE_RESCAN_S, DEFAULT_CUES, ExternalControl, hopeless, merge_duplicates, obeys, same_spot, FOV_RATE, MEMORY_VERSION, PAN_RATE, cue_boost, standout_tiles, zoom_on, QUIET_RECHECK_S, is_quiet, resting, sightings, TILT_RATE, DEFAULT_AVOID, Hunter, HunterConfig, View, ViewStats, aim_at,
+    CUE_RESCAN_S, DEFAULT_CUES, ExternalControl, camera_medians, hopeless, merge_duplicates, obeys, same_spot, FOV_RATE, MEMORY_VERSION, PAN_RATE, cue_boost, standout_tiles, zoom_on, QUIET_RECHECK_S, is_quiet, resting, sightings, TILT_RATE, DEFAULT_AVOID, Hunter, HunterConfig, View, ViewStats, aim_at,
     angle_delta, choose_next, likelihood_questions, move_slowly, prior_from, survey_views, tile_boxes,
 )
 
@@ -926,6 +926,9 @@ class FakeEmbedder:
     def share(self, vector):
         return self.share_value
 
+    def likeness(self, frame, tiles, wanted, avoid):
+        return self.share_value, {d: 0.65 for d in wanted}, {d: 0.6 for d in avoid}
+
     def tile_scores(self, vectors, cues):
         return self.tile_shares, self.tile_sims
 
@@ -955,12 +958,14 @@ def test_a_view_the_embedder_rates_hopeless_skips_clefs_scene_questions_and_tile
     assert choose_next(hunter.stats, view, now=1000.0, hour=10) == other
 
 
-def test_a_promising_view_is_still_scored_by_clef():
+def test_a_promising_view_is_scored_by_embeddings_and_clef_confirms():
     asked = []
     hunter, view = _looking_hunter(FakeEmbedder(share=0.6), asked)
     hunter._look(survey=True, view=view)
-    assert any(q.startswith("_") for q in asked[0]) and ["tiles"] in asked
-    assert hunter.stats[view].embed == 0.6 and not hopeless(hunter.stats[view])
+    assert asked[0] == ["t0"] and ["tiles"] in asked  # no scene questions; Clef asks the hunt question and the tiles
+    stats = hunter.stats[view]
+    assert stats.embed == 0.6 and stats.scored and not hopeless(stats) and stats.prior > 0.3
+    assert set(stats.likeness) == {"Is there a person in view?", "Is there a path or walkway?"}
 
 
 def test_with_the_embedder_down_clef_scores_the_view_as_before():
@@ -994,3 +999,27 @@ def test_good_share_and_standout_tiles():
     tiles = [{"path": 0.62}] * 4 + [{"path": 0.73}] + [{"path": 0.63}] * 4
     ((index, score, cue),) = standout_tiles(tiles)
     assert index == 4 and cue == "path" and score == pytest.approx(1.0)
+
+
+def test_descriptions_become_clef_questions_and_questions_stay():
+    from clef_operator.hunter import as_question
+    assert as_question("a person") == "Is there a person in view?"
+    assert as_question(" a delivery van ") == "Is there a delivery van in view?"
+    assert as_question("Is there a person in view?") == "Is there a person in view?"
+
+
+def test_views_are_ranked_by_how_much_more_they_look_like_the_target_than_the_usual_view():
+    from clef_operator.hunter import embedded_prior
+    cfg = HunterConfig("cam", targets=["a person"], cues=["a picnic table"], avoid=["trees"])
+    usual = {"a person": 0.62, "a picnic table": 0.62}
+    views = [ViewStats(embed=0.6, likeness=dict(usual), unlike={"trees": 0.70}) for _ in range(5)]
+    picnic = ViewStats(embed=0.6, likeness={"a person": 0.64, "a picnic table": 0.70}, unlike={"trees": 0.70})
+    forest = ViewStats(embed=0.5, likeness=dict(usual), unlike={"trees": 0.80})
+    like_m = camera_medians([v.likeness for v in views + [picnic, forest]])
+    unlike_m = camera_medians([v.unlike for v in views + [picnic, forest]])
+    avoid_usual, prior_usual = embedded_prior(views[0], cfg, like_m, unlike_m)
+    avoid_picnic, prior_picnic = embedded_prior(picnic, cfg, like_m, unlike_m)
+    avoid_forest, prior_forest = embedded_prior(forest, cfg, like_m, unlike_m)
+    assert prior_picnic > prior_usual > prior_forest
+    assert avoid_usual < 0.1  # trees in every view of the yard: not a reason to avoid them all
+    assert avoid_forest >= 0.75  # mostly trees, far more than the usual view

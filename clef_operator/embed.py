@@ -106,6 +106,16 @@ class Embedder:
         """The good-place share of an image's vector."""
         return good_share(vector, self.texts(GOOD), self.texts(BAD))
 
+    def likeness(self, frame: list[float], tiles: list[list[float]], wanted: list[str],
+                 avoid: list[str]) -> tuple[float, dict[str, float], dict[str, float]]:
+        """One look against the hunter's descriptions: the frame's good-place share; for each wanted description
+        (what to look for, where to look closer) the best similarity over the frame and its tiles (small things show
+        in a tile); for each stay-away description the frame's similarity (a whole view of it, not a corner)."""
+        share = self.share(frame)
+        like = {d: max(dot(v, t) for v in [frame] + tiles) for d, t in zip(wanted, self.texts(wanted))} if wanted else {}
+        unlike = {d: dot(frame, t) for d, t in zip(avoid, self.texts(avoid))} if avoid else {}
+        return share, like, unlike
+
     def tile_scores(self, vectors: list[list[float]], cues: list[str]) -> tuple[list[float], list[dict[str, float]]]:
         """For each tile's vector: its good-place share, and its similarity to each helper cue."""
         good, bad, cue_vectors = self.texts(GOOD), self.texts(BAD), self.texts(cues)

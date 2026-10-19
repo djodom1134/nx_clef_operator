@@ -55,6 +55,7 @@ from pathlib import Path
 
 from .classify import classify
 from .dashboard import AnswerBoard, SystemHistory, page, strip_page
+from . import embed as embedding
 from .embed import Embedder
 from .embed_map import EmbedMap
 from .hunter import Hunter, HunterConfig, NxPtz, View
@@ -656,16 +657,27 @@ class Gateway:
                 "view": vars(hunter.status.view) if hunter.status.view else None,
                 "home": vars(hunter.home) if hunter.home else None, "magnets": [vars(m) for m in hunter.magnets],
                 "pan_range": [hunter.config.pan_min, hunter.config.pan_max], "views": hunter.learned(hour),
-                "embedded": len(self.embed_maps[camera_id.strip("{}")].entries) if camera_id.strip("{}") in self.embed_maps else 0}
+                "embedded": len(self.embed_maps[camera_id.strip("{}")].entries) if camera_id.strip("{}") in self.embed_maps else 0,
+                "look_for": list(hunter.config.targets), "look_closer": list(hunter.config.cues),
+                "stay_away": list(hunter.config.avoid)}
 
-    def hunter_search(self, camera_id: str, text: str, top: int = 8) -> dict:
-        """Plain-text search over what a PTZ hunter has seen: every map entry's similarity to ``text`` and the best."""
+    def hunter_search(self, camera_id: str, text: str = "", top: int = 8) -> dict:
+        """Plain-text search over what a PTZ hunter has seen: every map entry's similarity and the best matches. No
+        text: what the hunter is looking for (its "Look for" descriptions, the best of them per entry)."""
         camera_id = camera_id.strip("{}")
-        emap = self.embed_maps.get(camera_id)
+        emap, hunter = self.embed_maps.get(camera_id), self.hunters.get(camera_id)
         if emap is None or self.embedder is None:
             return {"error": "no embedding map for this camera", "entries": 0, "map": [], "top": []}
-        (query,) = self.embedder.texts([text.strip()], "query")
-        return {"query": text, **emap.search(query, top)}
+        if text.strip():
+            return {"query": text.strip(), "own": False, **emap.search(self.embedder.texts([text.strip()], "query"), top)}
+        if hunter is None or not hunter.config.targets:
+            return {"error": "nothing to search for", "entries": len(emap.entries), "map": [], "top": []}
+        # What the hunter looks for and where it looks closer, against what it stays away from (and walls, roofs,
+        # sky): where it is worth looking, not merely what is nearest to "a person" in an empty yard.
+        wanted = list(hunter.config.targets) + list(hunter.config.cues)
+        unwanted = list(hunter.config.avoid) + list(embedding.BAD)
+        return {"query": "; ".join(hunter.config.targets), "own": True, "versus": list(hunter.config.avoid),
+                **emap.search(self.embedder.texts(wanted, "query"), top, self.embedder.texts(unwanted, "query"))}
 
     def hunter_look(self, camera_id: str, pan: float, tilt: float, fov: float) -> dict:
         hunter = self.hunters.get(camera_id.strip("{}"))
@@ -778,9 +790,9 @@ def make_handler(gateway: Gateway, token: str | None):
                                         "minutes": gateway.system_history.series(time.time() - hours * 3600)})
             if path == "/v1/hunter_map" and query.get("camera"):
                 return self._send(200, gateway.hunter_map(query["camera"]))
-            if path == "/v1/hunter_search" and query.get("camera") and query.get("q"):
+            if path == "/v1/hunter_search" and query.get("camera"):
                 try:
-                    return self._send(200, gateway.hunter_search(query["camera"], query["q"][:200]))
+                    return self._send(200, gateway.hunter_search(query["camera"], query.get("q", "")[:200]))
                 except Exception as error:  # noqa: BLE001 - the embedding server may be down
                     return self._send(502, {"error": f"search failed: {error!r}"[:200]})
             if path == "/v1/hunter_thumb" and query.get("camera") and query.get("shot"):

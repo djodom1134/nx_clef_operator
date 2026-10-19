@@ -32,9 +32,11 @@ def test_search_ranks_by_similarity_one_result_per_spot(tmp_path):
     m.add_look(View(100.0, -10.0, 36.9), unit(1, 0, 0), [], [], b"wall", now=1.0)
     m.add_look(View(190.0, -10.0, 36.9), unit(0, 1, 0), [], [], b"picnic", now=2.0)
     m.add_look(View(250.0, -30.0, 36.9), unit(0.3, 1, 0), [], [], b"lawn", now=3.0)
-    found = m.search(unit(0, 1, 0), top=2)
+    found = m.search([unit(0, 1, 0)], top=2)
     assert [r["pan"] for r in found["top"]] == [190.0, 250.0] and len(found["map"]) == 3
     assert m.thumb(found["top"][0]["shot"]) == b"picnic"
+    contrast = m.search([unit(0, 1, 0)], top=1, negatives=[unit(0.3, 1, 0)])  # like a picnic, not like the lawn
+    assert contrast["top"][0]["pan"] == 190.0 and contrast["top"][0]["score"] > 0
 
 
 def test_the_map_survives_a_restart_and_drops_unused_thumbnails(tmp_path):

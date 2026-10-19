@@ -227,15 +227,19 @@ std::string deviceAgentSettingsModel(const std::vector<std::string>& zoneNames)
         }}},
         Json::object{{"type", "Section"}, {"name", "ptzHunter"}, {"caption", "PTZ hunter"}, {"items", Json::array{
             Json::object{{"type", "Banner"}, {"icon", "info"}, {"text",
-                "PTZ cameras only. Moves the camera slowly to views where the hunt questions are likely to be "
-                "answered yes, drifting back to magnet views and away from views that match an avoid question."}},
+                "PTZ cameras only. Describe in plain words what to look for: the hunter keeps a map of what every "
+                "direction looks like (an embedding of each look) and moves the camera slowly toward the directions "
+                "that look most like it, away from what it should stay away from. Clef confirms on every look. "
+                "Search the map from the Clef dashboard."}},
             checkBox("hunter.enabled", "Enable PTZ hunter", false),
-            textField("hunter.targets", "Hunt for", "Is there a person in view?", "Questions, separated with ';'"),
-            textField("hunter.avoid", "Also avoid", "",
-                "Extra negative questions, separated with ';' (vegetation, trees, sky and walls are always avoided)"),
-            textField("hunter.cues", "Look closer at places with", kDefaultHunterCues,
-                "Helper questions, separated with ';': places where the hunt questions are more often yes. The "
-                "hunter favours views where one stands out and zooms in on those spots"),
+            textField("hunter.targets", "Look for", kDefaultHunterTargets,
+                "What to find, in plain words, separated with ';' (e.g. a person; a delivery van)"),
+            textField("hunter.avoid", "Stay away from", "",
+                "Things not worth watching, in plain words, separated with ';' (e.g. trees close to the camera; the "
+                "neighbour's yard). Walls, roofs, the sky and leaves filling the view are always avoided"),
+            textField("hunter.cues", "Look closer at", kDefaultHunterCues,
+                "Places where what you look for tends to be, in plain words, separated with ';'. The hunter favours "
+                "directions that look like one and zooms in on them"),
             textField("hunter.magnets", "Magnet views", "",
                 "Preset numbers (e.g. 1, 2) or pan,tilt in degrees separated with ';'. Each preset is visited once "
                 "to learn where it points. The camera's resting view is always a magnet"),
@@ -358,7 +362,7 @@ CameraConfig parseCameraConfig(const Settings& s, const SystemConfig& system)
         }
     }
     c.hunter.enabled = getBool(s, "hunter.enabled", false);
-    c.hunter.targets = splitList(get(s, "hunter.targets", "Is there a person in view?"), ';');
+    c.hunter.targets = splitList(get(s, "hunter.targets", kDefaultHunterTargets), ';');
     c.hunter.avoid = splitList(get(s, "hunter.avoid"), ';');
     c.hunter.cues = splitList(get(s, "hunter.cues", kDefaultHunterCues), ';');
     // Magnets: preset numbers ("1, 2", "preset 3") or "pan,tilt[,fov]" in degrees. A field of only whole numbers
