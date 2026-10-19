@@ -190,6 +190,16 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
     `GET /v1/hunter_thumb?camera=&shot=`, `POST /v1/hunter_look {camera_id, pan, tilt, fov}`.
   - If the embedding server is down, the hunter scores views and scans tiles with Clef as before (it retries after
     60 s). `--embed ''` turns it off.
+- The hunter is set up with descriptions, not questions (camera page: "Look for", "Look closer at", "Stay away from",
+  e.g. "person"; "path; gate"; "trees; wall"). Each look records how much the view looks like each (the best of the
+  frame and its tiles for look-for and look-closer, the whole frame for stay-away), and a view's promise is how much
+  more it looks like them than the camera's median view does: trees in every view of a yard do not rule them all
+  out. Clef's scene questions are only the fallback when the embedding server is down; Clef still confirms every
+  look, asked "Is there <description> in view?" (questions from older settings are asked as they are). The
+  dashboard's hunter panel opens on where it is most worth looking: every direction scored by how much more it looks
+  like what it looks for and where it looks closer than like what it stays away from (and walls, roofs, sky); with
+  nobody in view, plain similarity to "person" ranked bushes first. Typing searches for anything else. "Found so far"
+  is the older map of what Clef's answers showed at each learned view.
 - Analytics events reach the Nx event log only when a rule uses them. Bookmark rules on these prolonged events
   need event state `none` and fire when the event ends.
 

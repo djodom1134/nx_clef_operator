@@ -73,10 +73,15 @@ class EmbedMap:
         if now - self._saved_at >= SAVE_EVERY_S:
             self.save()
 
-    def search(self, query: list[float], top: int = 8) -> dict:
-        """Every entry's similarity to ``query`` (for the map) and the ``top`` matches, best first."""
+    def search(self, queries: list[list[float]], top: int = 8, negatives: list[list[float]] | None = None) -> dict:
+        """Every entry's similarity to the queries (the best of them: "a person; a vehicle" finds either) for the map,
+        and the ``top`` matches, best first. With ``negatives``, the score is how much more an entry looks like the
+        best query than like the closest negative: with nobody in view, the directions closest to "a person" are
+        bushes; "a person or a path, not a bush" ranks the places worth watching."""
+        def sim(vectors: list[list[float]], e: dict) -> float:
+            return max(sum(a * b for a, b in zip(q, e["vec"])) for q in vectors)
         with self._lock:
-            scored = [(sum(a * b for a, b in zip(query, e["vec"])), e) for e in self.entries]
+            scored = [(sim(queries, e) - (sim(negatives, e) if negatives else 0.0), e) for e in self.entries]
         scored.sort(key=lambda se: -se[0])
         public = lambda s, e: {"pan": round(e["pan"], 1), "tilt": round(e["tilt"], 1), "fov": round(e["fov"], 1),  # noqa: E731
                                "score": round(s, 4), "t": e["t"], "shot": e["shot"], "box": e["box"], "kind": e["kind"]}

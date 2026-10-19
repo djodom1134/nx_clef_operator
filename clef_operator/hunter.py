@@ -155,6 +155,8 @@ class ViewStats:
     base_avoid: float = 0.0  # the built-in blockers alone (``avoid`` adds the operator's, weighed per camera)
     extra_avoid: dict[str, float] = field(default_factory=dict)  # operator's avoid question -> P(yes)
     embed: float = -1.0  # EmbeddingGemma's good-place share of the view (-1: not embedded; see embed.py)
+    likeness: dict[str, float] = field(default_factory=dict)  # look-for / look-closer description -> best similarity
+    unlike: dict[str, float] = field(default_factory=dict)  # stay-away description -> the frame's similarity
 
     def hit_rate(self, hour: int) -> float:
         return (self.hits.get(hour, 0) + 0.5) / (self.checks.get(hour, 0) + 2.0)
@@ -186,7 +188,7 @@ class ViewStats:
                 "checks": self.checks, "last_visit": self.last_visit, "last_yes": self.last_yes, "scored": self.scored,
                 "looks": self.looks, "seen": self.seen, "scene": self.scene, "cues": self.cues,
                 "cue_scan_at": self.cue_scan_at, "found_by": self.found_by, "base_avoid": self.base_avoid,
-                "extra_avoid": self.extra_avoid, "embed": self.embed}
+                "extra_avoid": self.extra_avoid, "embed": self.embed, "likeness": self.likeness, "unlike": self.unlike}
 
     @staticmethod
     def from_json(d: dict) -> "ViewStats":
@@ -199,7 +201,7 @@ class ViewStats:
                          {int(k): v for k, v in d.get("looks", {}).items()}, {int(k): v for k, v in d.get("seen", {}).items()},
                          d.get("scene", d["prior"] if d.get("scored") else -1.0), d.get("cues", {}),
                          d.get("cue_scan_at", 0.0), d.get("found_by", ""), d.get("base_avoid", d["avoid"]),
-                         d.get("extra_avoid", {}), d.get("embed", -1.0))
+                         d.get("extra_avoid", {}), d.get("embed", -1.0), d.get("likeness", {}), d.get("unlike", {}))
 
 
 # View scoring, checked against 40 hand-labelled Back PTZ views (rank correlation +0.75; the earlier prompts scored
@@ -232,6 +234,13 @@ VIEW_KINDS = {  # what fills the view; the last three are blockers too (catches 
     "below": "a roof, pergola or lattice right below the camera",
     "sky": "sky",
 }
+
+
+def as_question(text: str) -> str:
+    """A description ("a person") as the yes/no question Clef is asked ("Is there a person in view?"). The hunter's
+    settings are descriptions, matched by embedding; a question from older settings is kept as it is."""
+    text = text.strip()
+    return text if text.endswith("?") else f"Is there {text} in view?"
 
 
 def likelihood_questions(targets: list[str], interests: str = "", avoid: list[str] | None = None,
@@ -276,6 +285,28 @@ def cue_boost(cues: dict[str, float], medians: dict[str, float]) -> float:
     """0.5..1: how much a view's helper answers stand out from the camera's usual answers (0.5 when none do)."""
     standout = max([max(0.0, p - medians.get(c, 0.0)) for c, p in cues.items()] + [0.0])
     return 0.5 + 0.5 * min(1.0, 2.0 * standout)
+
+
+LIKE_SPREAD = 0.04  # similarity this far above the camera's median view counts as standing out fully
+UNLIKE_SPREAD = 0.06
+
+
+def embedded_prior(s: "ViewStats", cfg: "HunterConfig", like_medians: dict[str, float],
+                   unlike_medians: dict[str, float]) -> tuple[float, float]:
+    """(avoid, prior) of a view from its embeddings: how much more it looks like what to look for (and where to look
+    closer) than the camera's median view does, scaled by its good-place share; minus how much more it looks like
+    what to stay away from. Only standing out counts: trees are in almost every view of a yard, so "trees" as a
+    stay-away rules out the views that are mostly trees, not all of them."""
+    def standout(scores: dict[str, float], names: list[str], medians: dict[str, float], spread: float) -> float:
+        return max([(scores[n] - medians.get(n, scores[n])) / spread for n in names if n in scores] + [-1.0])
+    look_for = min(1.0, max(0.0, 0.5 + 0.5 * standout(s.likeness, list(cfg.targets), like_medians, LIKE_SPREAD)))
+    closer = min(1.0, max(0.0, standout(s.likeness, list(cfg.cues), like_medians, LIKE_SPREAD)))
+    away = min(1.0, max(0.0, standout(s.unlike, list(cfg.avoid), unlike_medians, UNLIKE_SPREAD)))
+    share = max(0.0, s.embed)
+    base_avoid = min(0.79, max(0.0, (0.35 - share) / 0.35))
+    avoid = max(base_avoid, 0.79 * away)
+    prior = min(1.0, share / 0.4) * (0.15 + 0.85 * look_for) * (0.75 + 0.25 * closer) * (1.0 - 0.79 * away)
+    return avoid, prior
 
 
 def standout_tiles(tiles: list[dict[str, float]]) -> list[tuple[int, float, str]]:
@@ -1153,28 +1184,34 @@ class Hunter:
         jpeg = self.ptz.snapshot()
         if not self._still_at(view):
             return None
-        hunt = {f"t{i}": noul(text) for i, text in enumerate(cfg.targets)}
+        hunt = {f"t{i}": noul(as_question(text)) for i, text in enumerate(cfg.targets)}
         questions = dict(hunt)
         stats = self.stats.setdefault(view, ViewStats())
         self._last_jpeg = jpeg
+        embedded = False
         if self.embedder is not None:
-            # Every look: the frame and its tiles into the map (about 0.45 s next to Clef), and the view's good-place
-            # share, which can rule it out before Clef's scene questions.
+            # Every look: the frame and its tiles into the map (about 0.45 s next to Clef), and how much the view looks
+            # like what the hunter is told to look for, look closer at and stay away from. That scores the view;
+            # Clef's scene questions are only the fallback when the embedding server is down.
             try:
                 boxes9 = tile_boxes(3)
                 frame, tile_vectors, thumb = self.embedder.look(jpeg, boxes9)
-                stats.embed = self.embedder.share(frame)
+                stats.embed, stats.likeness, stats.unlike = self.embedder.likeness(
+                    frame, tile_vectors, list(cfg.targets) + list(cfg.cues), list(cfg.avoid))
+                stats.scored, stats.scene, embedded = True, stats.embed, True
                 self._look_vectors = (jpeg, tile_vectors)
                 if self.embed_map is not None:
                     self.embed_map.add_look(view, frame, tile_vectors, boxes9, thumb)
+                self._reprice()
             except Exception:  # noqa: BLE001 - the embedding server is down: Clef scores the view as before
                 self._look_vectors = None
         if hopeless(stats):
             # Nothing a person could be on: Clef's scene questions would only confirm it. The hunt questions are
             # still asked (this look is not wasted), and the view is never chosen for hunting again.
             stats.scored, stats.scene = True, max(0.0, stats.embed)
-        elif survey or not stats.scored or (cfg.cues and not stats.cues):
-            questions.update(likelihood_questions(cfg.targets, cfg.interests, cfg.avoid, cfg.cues))
+        elif not embedded and (survey or not stats.scored or (cfg.cues and not stats.cues)):
+            questions.update(likelihood_questions([as_question(t) for t in cfg.targets], cfg.interests,
+                                                  [as_question(a) for a in cfg.avoid], [as_question(c) for c in cfg.cues]))
         answers = self._ask(jpeg, questions)
         if answers is None:
             stats.last_visit = self.clock()
@@ -1198,7 +1235,7 @@ class Hunter:
             # Clef says well whether something is in any of several images, not which: ask all the tiles at once, and
             # one by one only to find where (an empty view, the usual case, costs one request instead of nine).
             gate = self._ask(tiles, {q: noul("These images are overlapping tiles of one camera snapshot. "
-                                             f"{cfg.targets[int(q[1:])]} Answer yes if so in any of them.")
+                                             f"{as_question(cfg.targets[int(q[1:])])} Answer yes if so in any of them.")
                                      for q in hunt})
             if gate:
                 self._last_look_p = max(self._last_look_p, *(gate[q]["true"] for q in hunt))
@@ -1237,7 +1274,7 @@ class Hunter:
             closer = self._go(aim_at(view, box, cfg.min_fov))
             if closer is None:
                 return
-            answers = self._ask(self.ptz.snapshot(), {"t": noul(question)})
+            answers = self._ask(self.ptz.snapshot(), {"t": noul(as_question(question))})
             p = answers["t"]["true"] if answers else 0.0
             spot = self.stats.setdefault(closer, ViewStats(prior=stats.prior))
             spot.visits += 1
@@ -1274,7 +1311,12 @@ class Hunter:
         "Is there a tree in view?" is yes in almost every view of a yard, and must not rule them all out."""
         cue_medians = camera_medians([s.cues for s in self.stats.values() if s.cues])
         avoid_medians = camera_medians([s.extra_avoid for s in self.stats.values() if s.extra_avoid])
+        like_medians = camera_medians([s.likeness for s in self.stats.values() if s.likeness])
+        unlike_medians = camera_medians([s.unlike for s in self.stats.values() if s.unlike])
         for s in self.stats.values():
+            if s.likeness or s.unlike:
+                s.avoid, s.prior = embedded_prior(s, self.config, like_medians, unlike_medians)
+                continue
             if s.scene < 0.0:
                 continue
             extra = max([max(0.0, p - avoid_medians.get(q, 0.0)) / max(0.05, 1.0 - avoid_medians.get(q, 0.0))
@@ -1282,12 +1324,12 @@ class Hunter:
             s.avoid = max(s.base_avoid, extra)
             s.prior = s.scene * (1.0 - extra) * (cue_boost(s.cues, cue_medians) if s.cues else 0.75)
 
-    def _scan_tiles(self, view: View, jpeg: bytes) -> None:
+    def _scan_tiles(self, view: View, jpeg: bytes) -> None:  # noqa: C901
         """Ask each tile of a promising view the helper questions (at most every ``CUE_RESCAN_S``), and add a zoomed
         view on each tile where one stands out: the hunter then looks closer where a yes is likelier. Wide views and
         once-zoomed views are scanned (two levels: about 18 and 9 degrees from a 37 degree wide view)."""
         cfg, stats = self.config, self.stats.get(view)
-        if (not cfg.cues or not cfg.zoom_in or not jpeg or stats is None or self.home is None
+        if (not (cfg.cues or cfg.targets) or not cfg.zoom_in or not jpeg or stats is None or self.home is None
                 or view.fov < 0.4 * self.home.fov or self.clock() - stats.cue_scan_at < CUE_RESCAN_S):
             return
         boxes = tile_boxes(cfg.tiles)
@@ -1297,7 +1339,7 @@ class Hunter:
                     _, vectors, _ = self.embedder.look(jpeg, boxes)
                 else:
                     vectors = self._look_vectors[1]  # this look's tiles were embedded already
-                shares, sims = self.embedder.tile_scores(vectors, list(cfg.cues))
+                shares, sims = self.embedder.tile_scores(vectors, list(cfg.cues) + list(cfg.targets))
             except Exception:  # noqa: BLE001 - the embedding server is down: ask Clef tile by tile, as before
                 shares = None
             if shares is not None:
@@ -1312,7 +1354,9 @@ class Hunter:
                                                   embed=shares[index])
                 self._save()
                 return
-        questions = {f"c{i}": noul(text) for i, text in enumerate(cfg.cues)}
+        if not cfg.cues:
+            return
+        questions = {f"c{i}": noul(as_question(text)) for i, text in enumerate(cfg.cues)}
         tiles = []
         for box in boxes:
             answers = self._ask(self.crop(jpeg, *box), questions)
@@ -1396,7 +1440,7 @@ class Hunter:
             jpeg = self.ptz.snapshot()
             if not self._still_at(view):
                 break
-            answers = self._ask(jpeg, {"t": noul(question)})
+            answers = self._ask(jpeg, {"t": noul(as_question(question))})
             if answers and answers["t"]["true"] >= cfg.threshold:
                 until = self.clock() + cfg.dwell_s
         self.status.state, self.status.found = phase, ""

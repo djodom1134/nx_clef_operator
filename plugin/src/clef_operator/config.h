@@ -60,8 +60,11 @@ struct SystemConfig
     std::vector<QuestionConfig> questions;
 };
 
-inline const char* const kDefaultHunterCues = "Is there a path or walkway?; Is there a gate?; "
-    "Is there a play area or play equipment?; Is there a picnic table, patio or seating area?; Is there a yard?";
+// Plain descriptions, matched by embedding (questions from older settings still work: the gateway turns a description
+// into a yes/no question for Clef, and leaves a question as it is).
+inline const char* const kDefaultHunterTargets = "a person";
+inline const char* const kDefaultHunterCues = "a path or walkway; a gate; a play area or play equipment; "
+    "a picnic table, patio or seating area";
 
 struct HunterSettings
 {

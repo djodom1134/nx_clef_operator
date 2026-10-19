@@ -292,7 +292,7 @@ On a PTZ camera, the hunter moves the camera to wherever a question is most like
 
 **Presets.** Nx lists the camera's preset IDs but not their positions, and activating a preset jumps at full speed (and on Back PTZ the activate call did not move the camera at all). So presets are not used as magnets automatically. Open question: allow a one-time, opt-in calibration that visits each hotkeyed preset once to record its position.
 
-**Settings (camera page, PTZ hunter section).** Enable; hunt for (questions, ';'-separated); also avoid (extra negative questions); look closer at places with (helper questions); magnet views (pan,tilt[,zoom]); found-at threshold; maximum motor speed; rest between moves; dwell when found (capped at 10 minutes per stay); time zoomed all the way out; focus time after zooming; take back after an operator or auto-tracking; pan range; status (read-only).
+**Settings (camera page, PTZ hunter section).** Enable; look for (descriptions, ';'-separated, e.g. "a person"); stay away from (descriptions); look closer at (descriptions of places where what it looks for tends to be); magnet views (pan,tilt[,zoom]); found-at threshold; maximum motor speed; rest between moves; dwell when found (capped at 10 minutes per stay); time zoomed all the way out; focus time after zooming; take back after an operator or auto-tracking; pan range; status (read-only).
 
 **Cost.** One image request per view (about 0.5 to 1 s of model time), at Low priority, so hunting uses spare GPU time and never delays critical windows. With about 4 s per view (move, settle, ask), a 20-view survey takes under 2 minutes.
 

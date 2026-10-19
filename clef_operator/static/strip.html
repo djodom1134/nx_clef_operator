@@ -52,6 +52,7 @@ body.nx .spark { cursor: pointer; }
 .foot .axis { margin-left: auto; }
 .hs { display: none; gap: .4em; }
 .hs.on { display: flex; }
+.hlabel { align-self: center; white-space: nowrap; color: var(--ink-2); font-size: .85em; }
 .hs input { flex: 1; min-width: 0; font: inherit; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 5px; padding: .2em .5em; }
 .hs button, .hres button { font: inherit; font-size: .85em; color: var(--ink); background: var(--surface); border: 1px solid var(--border); border-radius: 5px; padding: .15em .6em; cursor: pointer; }
 .hres { display: flex; gap: .45em; }
@@ -66,7 +67,7 @@ body.nx .spark { cursor: pointer; }
 <body>
 <div class="head"><h1 id="name">Clef</h1><span class="meta" id="meta"></span></div>
 <div id="rows"></div>
-<form class="hs" id="hs"><input id="hq" type="search" placeholder="Search what this PTZ has seen…" aria-label="Search what this PTZ has seen"><button type="submit">Search</button></form>
+<form class="hs" id="hs"><span id="hlabel" class="hlabel"></span><input id="hq" type="search" placeholder="or search for anything else it has seen…" aria-label="Search what this PTZ has seen"><button type="submit">Search</button></form>
 <div class="hres" id="hres" aria-label="Best matches"></div>
 <div class="foot"><span id="foot"></span><span class="axis" id="axis"></span></div>
 <div class="tip" id="tip"></div>
@@ -109,12 +110,16 @@ async function jumpTo(t) {
     flash(`could not move the timeline: ${e && e.message || e}`);
   }
 }
-// PTZ cameras: plain-text search over what the hunter has seen (its embedding map), best three with "Look there".
+// PTZ cameras: where the hunter's embedding map looks most like what it is looking for (or like what was typed),
+// best three with "Look there".
+let ownQuery = true, hunterShown = false;
 async function searchMap(q) {
   q = q.trim();
-  if (!q) { $("hres").replaceChildren(); return; }
+  ownQuery = !q;
   let res;
-  try { res = await api("/v1/hunter_search", { camera: CAMERA, q }); } catch (e) { flash("search failed: is the embedding server running?"); return; }
+  try { res = await api("/v1/hunter_search", q ? { camera: CAMERA, q } : { camera: CAMERA }); }
+  catch (e) { if (q) flash("search failed: is the embedding server running?"); return; }
+  $("hlabel").textContent = res.query ? (res.own ? "Most worth looking:" : `Matches for “${res.query}”:`) : "";
   const now = Date.now() / 1000, keep = TOKEN ? `&token=${encodeURIComponent(TOKEN)}` : "";
   $("hres").innerHTML = (res.top || []).slice(0, 3).map((r, i) => {
     const [x, y, w, h] = r.box;
@@ -199,6 +204,7 @@ function render() {
   }).join("");
   const hunter = latest.hunters && latest.hunters[cam.id];
   $("hs").classList.toggle("on", !!hunter);
+  if (hunter && !hunterShown) { hunterShown = true; searchMap(""); setInterval(() => { if (ownQuery) searchMap(""); }, 30000); }
   $("foot").textContent = note || [hunter ? `PTZ ${hunter.state}${hunter.mode && hunter.state === "hunting" ? `, ${hunter.mode}` : ""}` : "",
                            cam.questions.length ? `answered in ${cam.questions[0].latency_s ?? "-"} s` : ""].filter(Boolean).join(" · ");
   $("axis").textContent = `last ${HOURS < 1 ? `${HOURS * 60} min` : `${HOURS} h`} · now ${clock(latest.generated_at)}`;
