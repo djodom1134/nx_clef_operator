@@ -438,6 +438,11 @@ function hunterMap(id) {
 
 // Plain-text search over what the PTZ has seen: every direction it has looked (each look's frame and its 9 tiles,
 // as EmbeddingGemma vectors) against the words typed. The map is then colored by match instead of by promise.
+// What the hunter is doing, in words: wide is its stance; it says why when it zooms in.
+function hunterDoing(m) {
+  if (m.zoom_reason) return m.zoom_reason;
+  return m.mode === "wide" ? `${m.state}, wide: taking in as much as it can` : `${m.state} · ${m.mode}`;
+}
 function hunterSearchForm(id, search) {
   const input = el("input", { type: "search", class: "hsearch", value: search.q || "", "aria-label": "Search what this PTZ has seen",
                               placeholder: "Search for anything else it has seen: picnic table, the gate, a parked car…" });
@@ -550,14 +555,14 @@ function hunterMapSvg(W, m, found) {
   }
   if (found && found.map && found.map.length) {
     return [el("div", { class: "mini" }, el("h4", { text: found.own ? `Worth looking: like ${found.query}, the places to look closer, not ${(found.versus || []).join(", ") || "walls or sky"}` : `Looks like “${found.query}”` }),
-      el("div", { class: "meta", text: (m.handed_over_s ? `handed over to an operator or the camera's tracking for ${m.handed_over_s} s more` : `${m.state} · ${m.mode}`) +
+      el("div", { class: "meta", text: (m.handed_over_s ? `handed over to an operator or the camera's tracking for ${m.handed_over_s} s more` : hunterDoing(m)) +
         ` · ${found.entries} directions seen · numbers mark the best matches, one per spot` })), s,
       el("div", { class: "legend" },
         el("span", {}, el("i", { style: "background:" + ramp[4] }), "closest match"), el("span", {}, el("i", { style: "background:" + ramp[0] }), "least like it"),
         el("span", { text: "◇ home" }), el("span", { text: "small dots: zoomed directions" }))];
   }
   return [el("div", { class: "mini" }, el("h4", { text: "Found so far (Clef's answers at each learned view)" }),
-    el("div", { class: "meta", text: (m.handed_over_s ? `handed over to an operator or the camera's tracking for ${m.handed_over_s} s more` : `${m.state} · ${m.mode}`) + ` · ${views.length} views learned · ${views.filter(v => v.quiet).length} quiet` + (m.embedded ? ` · ${m.embedded} directions embedded (search above)` : "") })), s,
+    el("div", { class: "meta", text: (m.handed_over_s ? `handed over to an operator or the camera's tracking for ${m.handed_over_s} s more` : hunterDoing(m)) + ` · ${views.length} views learned · ${views.filter(v => v.quiet).length} quiet` + (m.embedded ? ` · ${m.embedded} directions embedded (search above)` : "") })), s,
     el("div", { class: "legend" },
       el("span", {}, el("i", { style: "background:" + ramp[4] }), "promising"), el("span", {}, el("i", { style: "background:" + ramp[0] }), "less so"),
       el("span", {}, el("i", { class: "ring" }), "quiet"), el("span", { text: "× blocked" }), el("span", { text: "◇ home" }),

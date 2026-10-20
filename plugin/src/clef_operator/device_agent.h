@@ -5,6 +5,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <string>
@@ -41,6 +42,8 @@ protected:
 
 private:
     void pushMotion(const nx::sdk::analytics::IMotionMetadataPacket* motion);
+    /** PTZ hunter cameras: the motion grid, OR-ed over half a second, to the gateway (POST /v1/motion). */
+    void streamHunterMotion(int64_t timestampUs, const CellMask& cells);
     /** Start, update or stop this camera's PTZ hunter in the gateway; returns a status line for the page. */
     std::string updateHunter(const CameraConfig& camera, const SystemConfig& system);
     void closeWindow(int64_t endUs, bool onsetWindow);
@@ -80,6 +83,11 @@ private:
     std::map<std::string, OpenEvent> m_openEvents; //< by question id, while its event is open
     int64_t m_lastHealthUs = 0;
     bool m_hunterWasEnabled = false;
+    std::atomic<bool> m_hunterOn{false};
+    // Push thread only: the hunter's motion stream.
+    CellMask m_hunterCells{};
+    int64_t m_hunterSentUs = 0;
+    std::shared_ptr<std::atomic<bool>> m_motionInFlight = std::make_shared<std::atomic<bool>>(false);
 
     // Worker pool for gateway requests (they block for seconds).
     std::mutex m_taskMutex;
