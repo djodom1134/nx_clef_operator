@@ -78,8 +78,8 @@ struct HunterSettings
     double maxSpeed = 0.1;
     int restSeconds = 20;
     int dwellSeconds = 60;
-    int widePercent = 75; //< share of the time spent zoomed all the way out; the rest, looking closer at spots
     int focusSeconds = 4; //< after a zoom change, no commands or snapshots while the camera refocuses
+    double cameraHeight = 3.5; //< metres: the hunter judges how far a spot is (and how far to zoom) from it
     int handBackSeconds = 10; //< an operator or the camera's auto-tracking moved it: hand back after it is this still
     double panMin = 0.0; //< degrees
     double panMax = 360.0;

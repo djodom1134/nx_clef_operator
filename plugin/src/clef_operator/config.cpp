@@ -247,8 +247,8 @@ std::string deviceAgentSettingsModel(const std::vector<std::string>& zoneNames)
             doubleSpinBox("hunter.maxSpeed", "Maximum motor speed", 0.1, 0.02, 1.0),
             spinBox("hunter.restSeconds", "Rest between moves (s)", 20, 0, 600),
             spinBox("hunter.dwellSeconds", "Dwell when found (s)", 60, 10, 1800),
-            spinBox("hunter.widePercent", "Time zoomed all the way out (%)", 75, 0, 100),
             spinBox("hunter.focusSeconds", "Focus time after zooming (s)", 4, 0, 30),
+            doubleSpinBox("hunter.cameraHeight", "Camera height above the ground (m)", 3.5, 0.5, 100.0),
             spinBox("hunter.handBackSeconds", "Take back after an operator or auto-tracking (s)", 10, 5, 3600),
             doubleSpinBox("hunter.panMin", "Pan from (degrees)", 0.0, -1.0, 360.0),
             doubleSpinBox("hunter.panMax", "Pan to (degrees)", 360.0, -1.0, 360.0),
@@ -397,9 +397,9 @@ CameraConfig parseCameraConfig(const Settings& s, const SystemConfig& system)
     c.hunter.maxSpeed = getDouble(s, "hunter.maxSpeed", 0.1);
     c.hunter.restSeconds = (int) getDouble(s, "hunter.restSeconds", 20);
     c.hunter.dwellSeconds = (int) getDouble(s, "hunter.dwellSeconds", 60);
-    c.hunter.widePercent = (int) getDouble(s, "hunter.widePercent", 75);
     c.hunter.focusSeconds = (int) getDouble(s, "hunter.focusSeconds", 4);
     c.hunter.handBackSeconds = (int) getDouble(s, "hunter.handBackSeconds", 10);
+    c.hunter.cameraHeight = getDouble(s, "hunter.cameraHeight", 3.5);
     c.hunter.panMin = getDouble(s, "hunter.panMin", 0.0);
     c.hunter.panMax = getDouble(s, "hunter.panMax", 360.0);
     if (std::fabs(c.hunter.panMin) <= 1.0 && std::fabs(c.hunter.panMax) <= 1.0 && c.hunter.panMax > c.hunter.panMin)

@@ -58,7 +58,9 @@ from .dashboard import AnswerBoard, SystemHistory, page, strip_page
 from . import embed as embedding
 from .embed import Embedder
 from .embed_map import EmbedMap
-from .hunter import Hunter, HunterConfig, NxPtz, View
+from .embed_map import unpack as unpack_vector
+from .action import decode as decode_cells
+from .hunter import Hunter, HunterConfig, NxPtz, View, detection_kind
 from .clef import Clef, image_data_url, video_data_url
 from .nx import Nx
 from .motion import MotionRank
@@ -279,6 +281,7 @@ class Gateway:
         self.started = time.time()
         threading.Thread(target=self._work, daemon=True, name="worker").start()
         threading.Thread(target=self._save_dashboard_loop, daemon=True, name="dashboard-save").start()
+        threading.Thread(target=self._watch_detections, daemon=True, name="camera-detections").start()
         threading.Thread(target=self._sweep, daemon=True, name="sweeper").start()
 
     # The worker: one Clef request at a time, always the best job next.
@@ -531,7 +534,8 @@ class Gateway:
             self.embed_maps[camera_id] = EmbedMap(self.state_dir / f"embed_map_{camera_id}.json" if self.state_dir else None)
         hunter = Hunter(config, NxPtz(self.nx, camera_id), ask, on_found=found,
                         locate_preset=lambda preset: self.locate_preset(camera_id, preset), memory=memory,
-                        embedder=self.embedder, embed_map=self.embed_maps[camera_id])
+                        embedder=self.embedder, embed_map=self.embed_maps[camera_id],
+                        content_examples=self.content_examples(camera_id))
         if old:
             hunter.take_over_from(old)
         self.hunters[camera_id] = hunter
@@ -596,7 +600,8 @@ class Gateway:
                 "moves": st.moves, "last_answers": st.last_answers,
                 "hot_spots": [{"view": vars(v), "finds": s.total_hits, "visits": s.visits} for v, s in h.hot_spots()],
                 "camera_name": h.config.camera_name.strip(),
-                "mode": h._mode, "handed_over_s": max(0, round(h._handed_over_until - time.time())),
+                "mode": h._mode, "zoom_reason": h.zoom_reason,
+                "handed_over_s": max(0, round(h._handed_over_until - time.time())),
                 "wide_share": round(h.time_wide / (h.time_wide + h.time_zoomed), 2) if h.time_wide + h.time_zoomed else None,
                 "best_views": [r for r in learned if not r["quiet"]][:6],
                 "quiet_views": [r["view"] for r in learned if r["quiet"]],
@@ -653,6 +658,7 @@ class Gateway:
             return {"views": []}
         hour = datetime.now().hour
         return {"camera_name": hunter.config.camera_name.strip(), "state": hunter.status.state, "mode": hunter._mode,
+                "zoom_reason": hunter.zoom_reason, "motion": hunter.motion_status(),
                 "handed_over_s": max(0, round(hunter._handed_over_until - time.time())),
                 "view": vars(hunter.status.view) if hunter.status.view else None,
                 "home": vars(hunter.home) if hunter.home else None, "magnets": [vars(m) for m in hunter.magnets],
@@ -660,6 +666,49 @@ class Gateway:
                 "embedded": len(self.embed_maps[camera_id.strip("{}")].entries) if camera_id.strip("{}") in self.embed_maps else 0,
                 "look_for": list(hunter.config.targets), "look_closer": list(hunter.config.cues),
                 "stay_away": list(hunter.config.avoid)}
+
+    def content_examples(self, camera_id: str) -> list[tuple[list[float], str]]:
+        """A camera's labelled images (vector, class) for the hunter's content check (bench/content_eval.py --save)."""
+        path = self.state_dir / f"content_labels_{camera_id}.json" if self.state_dir else None
+        if path is None or not path.exists():
+            return []
+        try:
+            rows = json.loads(path.read_text()).get("examples", [])
+            return [(unpack_vector(r["vec"]), str(r["label"])) for r in rows]
+        except (OSError, ValueError, KeyError) as error:
+            log(f"content labels for {camera_id[:8]} unreadable: {error!r}")
+            return []
+
+    def motion(self, body: dict) -> dict:
+        """Half a second of a hunter camera's motion grid, from the plugin."""
+        hunter = self.hunters.get(str(body.get("camera_id", "")).strip("{}"))
+        if hunter is None:
+            return {"status": "no hunter"}
+        hunter.motion_frame(time.time(), decode_cells(str(body.get("cells", ""))))
+        return {"status": "ok"}
+
+    def _watch_detections(self, every_s: float = 2.0, fresh_s: float = 10.0) -> None:
+        """The hunter cameras' own detections (Nx object tracks from the camera's analytics, not Clef's): one of what
+        a hunter looks for hands the camera to its auto-tracking (``Hunter.camera_detected``)."""
+        while True:
+            time.sleep(every_s)
+            for camera_id, hunter in list(self.hunters.items()):
+                if hunter.status.state in ("stopped", "error", "waiting for PTZ") or not hunter.config.targets:
+                    continue
+                now = time.time()
+                try:
+                    tracks = self.nx._request("GET", f"/rest/v4/analytics/objectTracks?deviceId={camera_id}"
+                                                     f"&startTimeMs={int((now - 60) * 1000)}&maxObjectTracksToSelect=50")
+                except Exception:  # noqa: BLE001 - the Server may be restarting: try again next time
+                    continue
+                for track in tracks if isinstance(tracks, list) else []:
+                    type_id = str(track.get("objectTypeId", ""))
+                    if type_id.startswith("nx.clef_operator"):
+                        continue  # Clef's own answers are not detections
+                    last_seen = int(track.get("endTimeMs") or track.get("startTimeMs") or 0) / 1000
+                    kind = detection_kind(type_id, hunter.config.targets)
+                    if kind and now - last_seen <= fresh_s:
+                        hunter.camera_detected(now, kind, str(track.get("id")), last_seen)
 
     def hunter_search(self, camera_id: str, text: str = "", top: int = 8) -> dict:
         """Plain-text search over what a PTZ hunter has seen: every map entry's similarity and the best matches. No
@@ -822,6 +871,8 @@ def make_handler(gateway: Gateway, token: str | None):
                     return self._send(200, gateway.submit(body))
                 if self.path == "/v1/hunter":
                     return self._send(200, gateway.set_hunter(body))
+                if self.path == "/v1/motion":
+                    return self._send(200, gateway.motion(body))
                 if self.path == "/v1/hunter_look":
                     return self._send(200, gateway.hunter_look(str(body["camera_id"]), float(body["pan"]),
                                                                float(body["tilt"]), float(body["fov"])))

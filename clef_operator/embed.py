@@ -34,6 +34,32 @@ TILE_STANDOUT = 0.04  # a tile's similarity to a helper cue this far above the v
 DOWN_FOR_S = 60.0  # after a failed call, do not try again for this long (the hunter falls back to Clef)
 
 
+# What a view or tile mostly shows, so the hunter never looks at what it should not: the classes below, from these
+# descriptions and the camera's own labelled examples (``ContentModel``). Measured on 249 hand-labelled Back PTZ frames
+# and tiles, day and infrared night (bench/content_eval.py, leave-one-out): 129 of 140 trees, bushes, sky, siding and
+# pergola/roof views caught, 8 of 109 open views wrongly flagged (85% exact class). The good-place share before it caught
+# 69 (and only 3 of 23 pergola or roof views, 4 of 11 bushes) at its hopeless threshold.
+CONTENT = {
+    "tree": ["tree branches and leaves filling the view", "the canopy of a tree", "a close-up of an evergreen tree",
+             "leaves glowing white in an infrared night image", "a tree trunk close up"],
+    "bush": ["a bush or shrub seen from above", "a hedge or bushes close to the camera", "shrubs and flowers in a garden bed"],
+    "sky": ["the sky", "clouds in the sky", "a dark night sky", "a bright overexposed white sky"],
+    "siding": ["the siding or wall of a house close up", "a window or door of a house", "a close-up of a wooden fence post"],
+    "roof": ["a pergola or lattice seen from above", "the roof or eaves of a house", "wooden slats seen from above"],
+    "grass": ["a lawn of grass", "grass and fallen leaves on the ground", "bare ground at night", "a mowed lawn seen from above"],
+    "yard": ["an open backyard with a fence", "a playground or picnic area", "a park with a lawn and trees in the distance",
+             "a path through a yard", "a picnic table on a concrete slab"],
+}
+UNWANTED = frozenset({"tree", "bush", "sky", "siding", "roof", "stay away"})  # "stay away": the operator's descriptions
+CONTENT_DIMS = 256  # vectors cut to this (EmbeddingGemma is trained to allow it): as accurate, a third of the work
+UNWANTED_HOPELESS = 0.75  # a view this covered by things not to look at is never hunted
+UNWANTED_TILE = 0.5  # a tile this likely to be one is never zoomed in on
+# Not worth a close-up either: plain lawn. A tight zoom on grass shows nothing unless someone is there, and then
+# motion, Clef or the camera's own detection brings the hunter in anyway.
+DULL = UNWANTED | {"grass"}
+DULL_CLOSEUP = 0.5  # a close-up (or a tile it would come from) this likely to be dull is not taken
+
+
 def dot(a: list[float], b: list[float]) -> float:
     return sum(x * y for x, y in zip(a, b))
 
@@ -45,6 +71,50 @@ def good_share(image: list[float], good: list[list[float]], bad: list[list[float
     top = max(logits)
     weights = [math.exp(x - top) for x in logits]
     return sum(weights[:len(good)]) / sum(weights)
+
+
+def shorten(vector: list[float], dims: int = CONTENT_DIMS) -> list[float]:
+    head = vector[:dims]
+    norm = math.sqrt(sum(x * x for x in head)) or 1.0
+    return [x / norm for x in head]
+
+
+def _softmax(scores: dict[str, float]) -> dict[str, float]:
+    top = max(scores.values())
+    weights = {k: math.exp(v - top) for k, v in scores.items()}
+    total = sum(weights.values())
+    return {k: w / total for k, w in weights.items()}
+
+
+class ContentModel:
+    """What an image mostly shows: half from the class descriptions (zero-shot), half from the camera's labelled
+    examples (its ``k`` nearest), when it has any."""
+
+    def __init__(self, prompts: dict[str, list[list[float]]], examples: list[tuple[list[float], str]] | None = None,
+                 k: int = 7, temperature: float = TEMPERATURE) -> None:
+        self.prompts = {c: [shorten(v) for v in vs] for c, vs in prompts.items() if vs}
+        self.examples = [(shorten(v), c) for v, c in examples or [] if c in self.prompts]
+        self.k, self.temperature = k, temperature
+
+    def classify(self, vector: list[float]) -> dict[str, float]:
+        v = shorten(vector)
+        text = _softmax({c: max(dot(v, p) for p in ps) / self.temperature for c, ps in self.prompts.items()})
+        if not self.examples:
+            return text
+        nearest = sorted(((dot(v, e), c) for e, c in self.examples), reverse=True)[:self.k]
+        votes = {c: 0.0 for c in self.prompts}
+        for similarity, c in nearest:
+            votes[c] += math.exp(similarity / self.temperature)
+        total = sum(votes.values()) or 1.0
+        return {c: 0.5 * text[c] + 0.5 * votes[c] / total for c in self.prompts}
+
+    def unwanted(self, vector: list[float]) -> float:
+        """The chance it mostly shows something not to look at."""
+        return sum(p for c, p in self.classify(vector).items() if c in UNWANTED)
+
+    def dull(self, vector: list[float]) -> float:
+        """The chance it mostly shows something not worth a close-up (that, or plain lawn)."""
+        return sum(p for c, p in self.classify(vector).items() if c in DULL)
 
 
 def standout_tiles(sims: list[dict[str, float]]) -> list[tuple[int, float, str]]:
@@ -101,6 +171,15 @@ class Embedder:
             for text, vector in zip(missing, self._post({"texts": missing, "prompt": prompt})["vectors"]):
                 self._texts[(prompt, text)] = vector
         return [self._texts[(prompt, t)] for t in texts]
+
+    def content_model(self, examples: list[tuple[list[float], str]] | None = None,
+                      stay_away: list[str] | None = None) -> ContentModel:
+        """The content classes (plus the operator's stay-away descriptions as one more unwanted class), with a
+        camera's labelled examples."""
+        prompts = {c: self.texts(texts) for c, texts in CONTENT.items()}
+        if stay_away:
+            prompts["stay away"] = self.texts(list(stay_away))
+        return ContentModel(prompts, examples)
 
     def share(self, vector: list[float]) -> float:
         """The good-place share of an image's vector."""

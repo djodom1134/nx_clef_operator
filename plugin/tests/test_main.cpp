@@ -201,7 +201,8 @@ static void testHunterCues()
     const auto defaults = parseCameraConfig(Settings{}, SystemConfig());
     CHECK(defaults.hunter.cues.size() == 4 && defaults.hunter.cues[1] == "a gate");
     CHECK(defaults.hunter.targets.size() == 1 && defaults.hunter.targets[0] == "a person");
-    CHECK(defaults.hunter.widePercent == 75 && defaults.hunter.focusSeconds == 4 && defaults.hunter.handBackSeconds == 10);
+    CHECK(defaults.hunter.cameraHeight == 3.5);
+    CHECK(defaults.hunter.focusSeconds == 4 && defaults.hunter.handBackSeconds == 10);
     const auto custom = parseCameraConfig(Settings{{"hunter.cues", "Is there a bench?; Is there a door?"}}, SystemConfig());
     CHECK(custom.hunter.cues.size() == 2 && custom.hunter.cues[1] == "Is there a door?");
 }

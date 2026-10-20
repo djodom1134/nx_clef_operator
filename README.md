@@ -24,6 +24,7 @@ camera ──► Nx Server plugin (C++, plugin/)  ──jobs──►  Clef gate
 | `clef_operator/static/strip.html` | One camera's status strip (`/strip?camera=<id>`), to sit beside the camera in an Nx layout |
 | `scripts/nx_strips.py` | Adds a Web Page per Clef camera's strip and the shared layout "Clef status" to Nx |
 | `clef_operator/replay.py` | Offline replay: recording in, windows through the gateway, events out |
+| `clef_operator/action.py` | Motion while a PTZ holds still: learns where a view always moves (trees), spots action to zoom in on |
 | `clef_operator/embed.py` | EmbeddingGemma 2 client: a view's good-place share, tile cues (the hunter's cheap looks) |
 | `clef_operator/embed_map.py` | Each PTZ's embedding map in (pan, tilt, field of view), searchable with plain text |
 | `scripts/embed_server.py`, `scripts/embed.sh` | The EmbeddingGemma 2 server next to Clef (DGX, port 8300) |
@@ -99,10 +100,25 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
   at pan 190 the picnic-table tiles stood out at 0.90-0.95 and the path tiles at 0.72-0.75.
 - The hunter pans and tilts slowly (loud motors) but zooms in one step (silent): out before a pan, in after it. After
   any zoom it sends nothing for `focus_s` (default 4 s, camera page "Focus time after zooming") while the camera
-  refocuses. It spends `wide_share` of its time zoomed all the way out (default 75%, "Time zoomed all the way out");
-  the rest it looks closer, at zoomed views found by the helper questions, two levels deep (about 18 and 9 degrees).
+  refocuses. It decides its own zoom (a fixed share of time zoomed out, the earlier setting, kept it close up on
+  schedule whether or not there was anything to look closer at). Wide is its stance: a wide view takes in the most.
+  It looks around close up when it is bored of wide (each of its 5 most promising wide views watched in the last
+  10 minutes, after at least 5 minutes wide; or 15 minutes wide): 3 close-up spots or 2 minutes, then wide again. It
+  localizes on one tile when it needs to: Clef unsure about it, or the tile looking much more like what it looks for
+  than the camera's views usually do (+0.08 similarity), not the same spot again within 10 minutes; then wide again.
+  The dashboard says why it is zoomed in. Zooming in is for looking into the distance: from the camera's height
+  (camera page, default 3.5 m) and how steeply it looks down at a spot, the hunter estimates how tall a person there
+  would look, and only zooms where that is small, just far enough for the person to fill about a sixth of the
+  frame (a spot 15 degrees down is about 13 m away from 3.5 m, where a person is already 7 degrees tall in the
+  wide view: no zoom; 5 degrees down, about 40 m: zoom to about 19 degrees; near level: about 8). Before, its
+  close-ups were mostly at 12-20 degrees down, of the grass by the picnic tables. Magnet views (home, presets and
+  the operator's own) are always visited when their pull says so, whatever they look like: stay-away and hopeless
+  scores never rule them out. First run
+  (17:08): wide for 5 minutes, bored, 3 close-up spots in 2 minutes, wide again. Where a move arrived is judged
+  once the zoom reads back as asked: a second after zooming in to 9 degrees Back PTZ still read 37, and the close-up
+  look was learned as a look at the wide view it came from.
 - When the Server stops answering mid-hunt (a restart), the hunter stops the motor, waits for the PTZ and carries on.
-- The hunter gets bored: in each 4-minute cycle it is wide for `wide_share`, then looks around at zoomed views; and
+- The hunter gets bored of places too:
   each recent visit (fading over 10 minutes) scales the appeal of nearby views by 0.4 (up to four visits' worth), so
   it moves between the areas likely to show the target. Negative prompts weigh on every choice (value = yield x
   (1 - avoid)), and views with no chance of a yes are never hunted: mostly wall, roof or sky (built-in blockers 0.5 or
@@ -200,6 +216,34 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
   like what it looks for and where it looks closer than like what it stays away from (and walls, roofs, sky); with
   nobody in view, plain similarity to "person" ranked bushes first. Typing searches for anything else. "Found so far"
   is the older map of what Clef's answers showed at each learned view.
+- The camera's own detections are feedback. The gateway polls Nx object tracks for each hunter camera every 2 s; a
+  fresh track from the camera's analytics (Back PTZ: `nx.milesight.Person`, from the Milesight engine, whose
+  `AutoTracking.Enable` is on) whose kind matches a "Look for" description ("person" also matches people, human,
+  pedestrian...; "a van" matches Vehicle) is a find at the current view, and the camera's auto-tracking takes over:
+  the hunter stops at once, even mid-move, and sends nothing while the camera keeps reporting the track, plus the
+  take-back time.
+- Motion while the camera holds still. The plugin streams the Server's motion grid (44 x 32, OR-ed over half a
+  second) to the gateway (`POST /v1/motion`) for hunter cameras, 2 a second. The hunter uses it only when the PTZ
+  is still (not moving, refocusing, settling or handed over). Per view it learns each cell's share of frames with
+  motion, kept across visits: cells moving in 12% of frames or more are boring (waving trees, IR noise at night).
+  Action is a cluster of 2 or more other cells that keeps moving for a second and is new there (nothing near it 2-6 s
+  before) or moves fast (1.5 cells a second); nothing counts until the view has been watched 30 s. Action cuts the
+  hold short: the hunter goes there at full motor speed (no slow approach, no rest), zoomed for the motion's size and
+  distance, and Clef looks. Where action was pulls the hunter's choice of view for half an hour, twice as much at
+  night (19:00-07:00), when embeddings and Clef see less. At most one chase every 30 s.
+- What not to look at. Each look's frame and its 9 tiles are classified (embed.ContentModel) as tree, bush, sky,
+  siding (a house wall, window or door, a fence post close up), roof (or a pergola or lattice from above), grass or
+  yard, from class descriptions plus the camera's own labelled images (7 nearest), on 256 of the 768 dimensions
+  (as accurate, a third of the work). The operator's "Stay away from" descriptions are one more unwanted class. A
+  view's unwanted coverage (frame and tiles averaged) scales down its promise, and at 0.75 or more it is never hunted.
+  Close-ups are never taken of tiles or spots that are mostly unwanted or plain lawn: a tight zoom on grass shows
+  nothing unless someone is there, and then motion, Clef or the camera's detection brings the hunter in. Measured on
+  249 hand-labelled Back PTZ frames and tiles, day and infrared night (`bench/content_eval.py`, leave one out; labels
+  in `bench/content_labels/`): 129 of 140 trees, bushes, sky, siding and pergola views caught, 10 of 109 open views
+  wrongly flagged; plain lawn kept from close-ups 41 of 43, yard with something in it wrongly kept from them 15 of 66.
+  The good-place share before it caught 69 (3 of 23 pergola or roof views, 4 of 11 bushes). Labelled examples live in
+  `~/.clef_operator/content_labels_<camera>.json` (`bench/content_eval.py --save`); a camera without them uses the
+  descriptions alone (124 caught, 22 wrongly flagged).
 - Analytics events reach the Nx event log only when a rule uses them. Bookmark rules on these prolonged events
   need event state `none` and fire when the event ends.
 

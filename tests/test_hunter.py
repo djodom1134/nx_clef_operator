@@ -417,6 +417,7 @@ def test_the_hunter_holds_a_view_for_one_of_the_cameras_own_windows_only_when_th
     ptz = FakePtz()
     cfg = HunterConfig("cam", hold_s=52.0)
     hunter = Hunter(cfg, ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    hunter._mode = "looking around"  # close up: holding is only for the camera's own windows
     hunter._arrived_at = ptz.now
     hunter._hold()
     assert ptz.now == 0.0  # no windows arriving: nothing to wait for
@@ -482,7 +483,7 @@ def test_helper_answers_raise_a_view_only_where_they_stand_out_from_the_camera()
 
 def test_the_hunter_adds_zoomed_views_on_tiles_where_helpers_stand_out():
     ptz = FakePtz()
-    cfg = HunterConfig("cam", cues=["path", "seat", "yard"])
+    cfg = HunterConfig("cam", cues=["path", "seat", "yard"], camera_height_m=7.4)  # high enough that these tiles are far
     by_tile = {}
 
     def ask(camera_id, jpeg, questions):
@@ -500,7 +501,7 @@ def test_the_hunter_adds_zoomed_views_on_tiles_where_helpers_stand_out():
     hunter.stats[wide] = ViewStats(prior=0.8)
     hunter._scan_tiles(wide, b"jpeg")
     zoomed = [(v, s) for v, s in hunter.stats.items() if s.found_by]
-    assert 1 <= len(zoomed) <= 3 and all(v.fov == 18.5 for v, _ in zoomed)  # half the field of view
+    assert 1 <= len(zoomed) <= 3 and all(12.0 <= v.fov <= 24.0 for v, _ in zoomed)  # zoomed for their distance
     picnic = {zoom_on(wide, tile_boxes(3)[i], cfg.min_fov) for i in (4, 5, 7, 8)}
     assert {v for v, _ in zoomed} <= picnic  # centred on picnic-area tiles: centre, right, below, below right
     assert all(s.found_by in ("seat", "path") for _, s in zoomed)
@@ -591,26 +592,48 @@ def test_no_commands_are_sent_while_the_camera_refocuses():
     assert later and min(later) >= zoom_at + 4.0
 
 
-def test_the_hunter_watches_wide_for_three_quarters_of_each_cycle_then_gets_bored_and_looks_around():
+def test_the_hunter_stays_wide_until_bored_of_its_best_wide_views_then_looks_around_briefly():
     now = [0.0]
-    hunter = Hunter(HunterConfig("cam", wide_share=0.75, cycle_s=240.0), FakePtz(), lambda *a: {}, clock=lambda: now[0])
+    hunter = Hunter(HunterConfig("cam"), FakePtz(), lambda *a: {}, clock=lambda: now[0])
     hunter.home = View(184.0, -12.0, 37.0)
-    wide, close = View(190.0, -10.0, 37.0), View(175.0, -5.0, 18.5)
-    hunter.stats = {wide: ViewStats(prior=0.6), close: ViewStats(prior=0.6, found_by="play area")}
-    modes = []
-    for t in range(0, 480, 10):
-        now[0] = float(t)
-        modes.append("wide" if set(hunter._candidates()) == {wide} else "close")
-    assert modes.count("wide") / len(modes) == pytest.approx(0.75, abs=0.06)
-    assert "wide" in modes[:3] and "close" in modes  # starts wide, then gets bored
-    hunter.stats = {wide: ViewStats(prior=0.6), close: ViewStats(prior=0.6, avoid=0.9)}
-    now[0] = 1000.0
-    assert set(hunter._candidates()) == {wide}  # nothing close worth a look (blocked): stays wide
+    wides = [View(150.0, -10.0, 37.0), View(190.0, -10.0, 37.0), View(240.0, -25.0, 37.0)]
+    close = View(175.0, -5.0, 18.5)
+    hunter.stats = {v: ViewStats(prior=0.6) for v in wides} | {close: ViewStats(prior=0.6, found_by="play area")}
+    assert set(hunter._candidates()) == set(wides)  # wide is its stance
+    now[0] = 400.0
+    assert set(hunter._candidates()) == set(wides)  # wide a while, but its best views have not been watched lately
+    hunter.recent.extend((390.0, v) for v in wides)  # now each has been
+    assert set(hunter._candidates()) == {close} and hunter._mode == "looking around"
+    for _ in range(3):  # a look-around is a few close-up spots
+        hunter._closer_left -= 1
+    assert set(hunter._candidates()) == set(wides) and hunter._mode == "wide"
+    now[0] = 400.0 + 901.0
+    hunter.recent.clear()
+    assert set(hunter._candidates()) == {close}  # wide for 15 minutes: looks around anyway
+    hunter._mode, hunter._wide_since = "wide", now[0] - 2000.0
+    hunter.stats[close] = ViewStats(prior=0.6, avoid=0.9)
+    assert set(hunter._candidates()) == set(wides)  # nothing close worth a look (blocked): stays wide
+
+
+def test_a_tile_much_more_like_what_it_looks_for_is_zoomed_in_on_then_the_hunter_goes_wide():
+    sims = [{"Is there a person in view?": 0.62} for _ in range(9)]
+    sims[4] = {"Is there a person in view?": 0.75}  # the middle tile looks far more like a person than usual
+    asked = []
+    hunter, view = _looking_hunter(FakeEmbedder(share=0.5, tile_shares=[0.5] * 9, tile_sims=sims), asked)
+    hunter.home = view
+    hunter.config.camera_height_m = 40.0  # high up: the middle tile is far away
+    for pan in (100.0, 150.0, 200.0, 250.0):  # the camera's usual views, for the median
+        hunter.stats[View(pan, -10.0, 36.9)] = ViewStats(likeness={"Is there a person in view?": 0.62})
+    hunter._visit(view, survey=False)
+    zoomed = [v for v in hunter.stats if v.fov < 36.9]
+    assert zoomed and abs(zoomed[0].pan - view.pan) < 3.0  # centred on the middle tile, zoomed in
+    assert ["t"] in asked  # and Clef was asked about it there
+    assert hunter.zoom_reason == ""  # done: the next move is wide again
 
 
 def test_zoomed_views_can_be_scanned_for_a_second_zoom_level():
     ptz = FakePtz()
-    cfg = HunterConfig("cam", cues=["path", "seat", "yard"])
+    cfg = HunterConfig("cam", cues=["path", "seat", "yard"], camera_height_m=7.4)  # high enough that these tiles are far
     by_tile = {}
 
     def ask(camera_id, jpeg, questions):
@@ -627,7 +650,7 @@ def test_zoomed_views_can_be_scanned_for_a_second_zoom_level():
     closer = View.of(175.0, -5.0, 18.5)
     hunter.stats[closer] = ViewStats(prior=0.8, found_by="play area")
     hunter._scan_tiles(closer, b"jpeg")
-    assert any(v.fov == 9.0 or v.fov == 9.5 for v, s in hunter.stats.items() if s.found_by in ("seat", "path"))
+    assert any(6.0 <= v.fov <= 12.0 for v, s in hunter.stats.items() if s.found_by in ("seat", "path"))
 
 
 def test_only_zoom_ever_uses_an_absolute_move():
@@ -853,6 +876,22 @@ def test_after_a_zoom_the_hunter_waits_for_the_zoom_to_read_back_before_watching
     assert abs(hunter._expected.fov - 36.9) < 0.5  # where the zoom settled, not the late reading
     assert not hunter._watch(ptz.now)
 
+
+def test_a_close_up_look_is_learned_at_the_close_up_even_when_the_zoom_reads_back_late():
+    class LateZoom(FakePtz):  # 17:13 on Back PTZ: at 9 degrees, still reading 37 a second after zooming in
+        def absolute(self, view):
+            seen, at = self._seen, self._seen_at
+            super().absolute(view)
+            self._seen, self._seen_at = seen, at
+    ptz = LateZoom(View(194.5, -16.0, 36.9), lag=2.5)
+    ptz.position()
+    hunter = Hunter(HunterConfig("cam", settle_s=0.0, focus_s=0.0), ptz, lambda *a: {}, sleep=ptz.sleep,
+                    clock=lambda: ptz.now)
+    hunter.home = View(184.0, -12.0, 36.9)
+    wide, close = View(194.5, -16.0, 37.0), View(194.5, -16.0, 9.0)
+    hunter.stats = {wide: ViewStats(visits=10), close: ViewStats()}
+    assert hunter._go(close) == close and hunter.status.view == close
+
 def test_obeys_tells_the_hunters_command_from_someone_elses():
     a = View(200.0, -10.0, 36.9)
     assert obeys({"pan": 0.2}, a, View(212.0, -10.0, 36.9), 2.0)  # 6 degrees a second, as commanded
@@ -932,6 +971,22 @@ class FakeEmbedder:
     def tile_scores(self, vectors, cues):
         return self.tile_shares, self.tile_sims
 
+    def content_model(self, examples=None, stay_away=None):
+        return FakeContent(self.share_value)
+
+
+class FakeContent:
+    """The content check, from the fake's good-place share: little open ground, mostly things not to look at."""
+
+    def __init__(self, share):
+        self.share = share
+
+    def unwanted(self, vector):
+        return 1.0 - self.share
+
+    def dull(self, vector):
+        return max(0.0, 0.8 - self.share)
+
 
 def _looking_hunter(embedder, asked):
     ptz = FakePtz(View(131.0, -10.0, 36.9))
@@ -964,7 +1019,8 @@ def test_a_promising_view_is_scored_by_embeddings_and_clef_confirms():
     hunter._look(survey=True, view=view)
     assert asked[0] == ["t0"] and ["tiles"] in asked  # no scene questions; Clef asks the hunt question and the tiles
     stats = hunter.stats[view]
-    assert stats.embed == 0.6 and stats.scored and not hopeless(stats) and stats.prior > 0.3
+    assert stats.embed == 0.6 and stats.scored and not hopeless(stats) and stats.prior > 0.2
+    assert stats.unwanted == pytest.approx(0.4)  # 40% things not to look at: promising, but less so
     assert set(stats.likeness) == {"Is there a person in view?", "Is there a path or walkway?"}
 
 
@@ -984,6 +1040,7 @@ def test_the_tile_scan_uses_embeddings_and_skips_hopeless_tiles():
     asked = []
     hunter, view = _looking_hunter(FakeEmbedder(tile_shares=shares, tile_sims=sims), asked)
     hunter.home = view
+    hunter.config.camera_height_m = 40.0
     hunter.stats[view] = ViewStats(prior=0.6, scored=True, scene=0.6, cue_scan_at=-1e9)  # due for a scan
     hunter._scan_tiles(view, b"jpeg")
     children = [(v, s) for v, s in hunter.stats.items() if v.fov < view.fov]
@@ -1023,3 +1080,157 @@ def test_views_are_ranked_by_how_much_more_they_look_like_the_target_than_the_us
     assert prior_picnic > prior_usual > prior_forest
     assert avoid_usual < 0.1  # trees in every view of the yard: not a reason to avoid them all
     assert avoid_forest >= 0.75  # mostly trees, far more than the usual view
+
+
+
+def test_close_ups_are_for_the_distance_zoomed_to_suit_it():
+    from clef_operator.hunter import distant_zoom, target_degrees
+    cfg = HunterConfig("cam")  # 3.5 m up, looking for a person
+    assert target_degrees(-15.0, 3.5, 1.7) > 7.0  # 13 m away: already big in a 37 degree view
+    assert distant_zoom(View(190.0, -15.0, 37.0), cfg, 37.0) is None  # so no close-up of the grass there
+    mid, far = distant_zoom(View(190.0, -5.0, 37.0), cfg, 37.0), distant_zoom(View(190.0, -1.0, 37.0), cfg, 37.0)
+    assert 15.0 < mid < 25.0 and far == cfg.min_fov  # farther: zoomed in further
+
+
+def test_the_look_around_skips_close_ups_of_the_near_ground():
+    now = [1000.0]
+    hunter = Hunter(HunterConfig("cam"), FakePtz(), lambda *a: {}, clock=lambda: now[0])
+    hunter.home = View(184.0, -12.0, 37.0)
+    wide = View(190.0, -10.0, 37.0)
+    near_grass, far_gate = View(195.0, -15.0, 9.0), View(175.0, -3.0, 14.0)
+    hunter.stats = {wide: ViewStats(prior=0.6), near_grass: ViewStats(prior=0.9), far_gate: ViewStats(prior=0.5)}
+    hunter._wide_since = 0.0  # wide long enough to look around
+    assert set(hunter._candidates()) == {far_gate}
+
+
+def test_magnets_are_visited_even_when_they_look_like_something_to_avoid():
+    home, yard = View(248.0, -41.5, 37.0), View(190.0, -10.0, 37.0)
+    stats = {home: ViewStats(prior=0.3, visits=20, avoid=0.9, scored=True, scene=0.3),  # trees in front of the preset
+             yard: ViewStats(prior=0.6, visits=20, last_visit=990.0, scored=True, scene=0.6)}
+    pick = choose_next(stats, yard, now=1000.0, hour=10, magnets=[home], since_magnet_s=900.0)
+    assert pick == home  # away from it for 15 minutes: back to the magnet, trees or not
+
+
+def _still_hunter():
+    ptz = FakePtz(View(190.0, -5.0, 36.9))
+    hunter = Hunter(HunterConfig("cam", settle_s=0.0), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    hunter.home = View(190.0, -5.0, 36.9)
+    view = View(190.0, -5.0, 37.0)
+    hunter.stats[view] = ViewStats(prior=0.5)
+    hunter.status.view, hunter.status.state, hunter._arrived_at = view, "holding", -100.0
+    return hunter, ptz, view
+
+
+def test_action_in_the_distance_while_still_is_chased_quickly_and_zoomed_in_on():
+    from clef_operator.action import MIN_SEEN
+    hunter, ptz, view = _still_hunter()
+    t = 0.0
+    for _ in range(MIN_SEEN + 10):  # a quiet view, watched a while
+        hunter.motion_frame(t, set())
+        t += 0.5
+    person = {(30, 12), (30, 13), (31, 12), (31, 13)}  # right of centre, just below the horizon: far away
+    hunter.motion_frame(t, person)
+    hunter.motion_frame(t + 0.5, {(c + 1, r) for c, r in person})
+    assert hunter._action is not None and hunter.activity
+    ptz.now = t + 1.0
+    target = hunter._take_action()
+    assert target is not None and target.pan > view.pan and target.fov < 25.0  # to the right, zoomed in
+    assert "motion" in hunter.zoom_reason
+
+
+def test_motion_while_the_camera_moves_or_is_handed_over_is_ignored():
+    hunter, ptz, view = _still_hunter()
+    hunter._handed_over_until = 1e9
+    for i in range(200):
+        hunter.motion_frame(i * 0.5, {(30, 12), (31, 12)} if i > 100 else set())
+    assert hunter._watching is None and hunter._action is None
+
+
+def test_a_camera_detection_is_a_find_and_hands_the_camera_to_its_auto_tracking():
+    hunter, ptz, view = _still_hunter()
+    hunter.camera_detected(1000.0, "Person", "track-1", last_seen=1000.0)
+    assert hunter.stats[view].total_hits == 1 and hunter._yield
+    assert hunter._handed_over_until == 1000.0 + hunter.config.handback_s
+    hunter.camera_detected(1030.0, "Person", "track-1", last_seen=1030.0)  # still tracking it
+    assert hunter._handed_over_until == 1030.0 + hunter.config.handback_s and hunter.stats[view].total_hits == 1
+
+
+def test_a_move_under_way_stops_when_the_camera_detects_the_target():
+    ptz = FakePtz(View(190.0, -5.0, 36.9))
+    calls = [0]
+
+    def detected():
+        calls[0] += 1
+        return calls[0] > 4  # the camera sees a person a second into the move
+    with pytest.raises(ExternalControl):
+        move_slowly(ptz, View(250.0, -5.0, 36.9), max_speed=0.2, sleep=ptz.sleep, abort=detected)
+    assert ptz.speed == (0.0, 0.0, 0.0)  # its own move stopped, so the tracker can take the camera
+
+
+def test_recent_action_pulls_the_choice_of_view_more_at_night():
+    lawn, fence = View(190.0, -10.0, 37.0), View(250.0, -10.0, 37.0)
+    stats = {lawn: ViewStats(prior=0.5, visits=20, last_visit=900.0), fence: ViewStats(prior=0.5, visits=20, last_visit=900.0)}
+    activity = [(990.0, View(252.0, -8.0, 37.0))]  # something moved by the fence ten seconds ago
+    kw = dict(now=1000.0, hour=22, exploration=0.0, activity=activity)
+    assert choose_next(stats, View(220.0, -10.0, 37.0), activity_weight=0.8, **kw) == fence
+
+
+def test_the_cameras_detections_are_matched_to_what_the_hunter_looks_for():
+    from clef_operator.hunter import detection_kind
+    assert detection_kind("nx.milesight.Person", ["person"]) == "Person"
+    assert detection_kind("nx.milesight.Person", ["Is there a person in view?"]) == "Person"
+    assert detection_kind("nx.milesight.Person", ["someone at the gate"]) == "Person"
+    assert detection_kind("nx.milesight.Vehicle", ["a delivery van"]) == "Vehicle"
+    assert detection_kind("nx.milesight.Vehicle", ["person"]) is None
+    assert detection_kind("nx.milesight.Person", ["a parked car"]) is None
+
+
+
+def test_a_wide_view_is_watched_a_while_for_motion_and_action_cuts_it_short():
+    ptz = FakePtz()
+    hunter = Hunter(HunterConfig("cam"), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    hunter._arrived_at = ptz.now
+    hunter._hold()
+    assert ptz.now >= 20.0  # no windows coming, but wide: it watched (20 s by day, 45 at night)
+    hunter._arrived_at = ptz.now
+    hunter._action = (ptz.now, View(190.0, -10.0, 37.0), (0.4, 0.4, 0.1, 0.1))
+    start = ptz.now
+    hunter._hold()
+    assert ptz.now == start  # action: off to catch it at once
+
+
+
+def test_the_content_check_sorts_what_not_to_look_at_from_open_ground():
+    from clef_operator.embed import ContentModel
+    def unit(*xs):
+        n = sum(x * x for x in xs) ** 0.5
+        return [x / n for x in xs] + [0.0] * 253  # padded to the 256 dims the check uses
+    prompts = {"tree": [unit(1, 0, 0)], "grass": [unit(0, 1, 0)], "yard": [unit(0, 0, 1)]}
+    examples = [(unit(0.9, 0.1, 0), "tree"), (unit(0.1, 0.9, 0.1), "grass"), (unit(0, 0.2, 0.9), "yard")]
+    model = ContentModel(prompts, examples)
+    assert model.unwanted(unit(0.95, 0.05, 0)) > 0.9  # leaves
+    assert model.unwanted(unit(0, 0.3, 0.95)) < 0.1 and model.dull(unit(0, 0.3, 0.95)) < 0.1  # a fence line
+    assert model.unwanted(unit(0.05, 0.95, 0.1)) < 0.1 and model.dull(unit(0.05, 0.95, 0.1)) > 0.9  # plain lawn
+
+
+def test_no_close_ups_of_grass_or_trees_on_the_look_around():
+    now = [1000.0]
+    hunter = Hunter(HunterConfig("cam", camera_height_m=40.0), FakePtz(), lambda *a: {}, clock=lambda: now[0])
+    hunter.home = View(184.0, -12.0, 37.0)
+    wide = View(190.0, -10.0, 37.0)
+    lawn, gate = View(195.0, -5.0, 9.0), View(175.0, -3.0, 14.0)
+    hunter.stats = {wide: ViewStats(prior=0.6), lawn: ViewStats(prior=0.9, dull=0.9), gate: ViewStats(prior=0.5, dull=0.1)}
+    hunter._wide_since = 0.0
+    assert set(hunter._candidates()) == {gate}
+
+
+def test_close_ups_learned_before_the_content_check_are_classified_from_the_map():
+    from clef_operator.embed_map import EmbedMap
+    emap = EmbedMap()
+    lawn = View(195.0, -5.0, 9.0)
+    emap.add_look(lawn, [1.0, 0.0], [], [], b"", now=1.0)
+    hunter = Hunter(HunterConfig("cam"), FakePtz(), lambda *a: {}, embedder=FakeEmbedder(share=0.1), embed_map=emap)
+    hunter.home = View(184.0, -12.0, 37.0)
+    hunter.stats[lawn] = ViewStats(prior=0.9)
+    hunter._classify_close_ups()
+    assert hunter.stats[lawn].dull == pytest.approx(0.7)  # the fake: mostly lawn

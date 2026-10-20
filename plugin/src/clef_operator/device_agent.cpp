@@ -166,11 +166,12 @@ std::string DeviceAgent::updateHunter(const CameraConfig& camera, const SystemCo
         {"presets", Json::array(h.presets.begin(), h.presets.end())},
         {"threshold", h.threshold}, {"max_speed", h.maxSpeed}, {"rest_s", h.restSeconds},
         {"dwell_s", h.dwellSeconds}, {"pan_min", h.panMin}, {"pan_max", h.panMax},
-        {"wide_share", h.widePercent / 100.0}, {"focus_s", h.focusSeconds}, {"handback_s", h.handBackSeconds},
+        {"focus_s", h.focusSeconds}, {"camera_height_m", h.cameraHeight}, {"handback_s", h.handBackSeconds},
     };
     if (!h.enabled && !m_hunterWasEnabled)
         return "off";
     m_hunterWasEnabled = h.enabled;
+    m_hunterOn = h.enabled;
     const auto response = httpPostJson(system.gatewayUrl + "/v1/hunter", body.dump(), system.gatewayToken, 15);
     std::string error;
     const Json result = Json::parse(response.body, error);
@@ -215,6 +216,8 @@ void DeviceAgent::pushMotion(const IMotionMetadataPacket* motion)
         }
     }
     m_buffer.addMotion(ts, cells, any);
+    if (m_hunterOn)
+        streamHunterMotion(ts, cells);
     if (!any)
         return;
 
@@ -227,6 +230,37 @@ void DeviceAgent::pushMotion(const IMotionMetadataPacket* motion)
             m_onsetWindowEndUs = candidate;
     }
     m_lastMotionUs = ts;
+}
+
+void DeviceAgent::streamHunterMotion(int64_t timestampUs, const CellMask& cells)
+{
+    for (size_t i = 0; i < cells.size(); ++i)
+    {
+        if (cells[i])
+            m_hunterCells[i] = true;
+    }
+    if (m_hunterSentUs != 0 && timestampUs - m_hunterSentUs < kSecondUs / 2)
+        return;
+    m_hunterSentUs = timestampUs;
+    std::string bits((m_hunterCells.size() + 7) / 8, '\0'); //< Bit r * kGridW + c, least significant first.
+    for (size_t i = 0; i < m_hunterCells.size(); ++i)
+    {
+        if (m_hunterCells[i])
+            bits[i / 8] = (char) (bits[i / 8] | (1 << (i % 8)));
+    }
+    m_hunterCells = {};
+    if (m_motionInFlight->exchange(true))
+        return; //< The last half second is still on its way: drop this one rather than queue.
+    const auto system = m_engine->systemConfig();
+    const std::string url = system->gatewayUrl + "/v1/motion";
+    const std::string token = system->gatewayToken;
+    const std::string body = nx::kit::Json(nx::kit::Json::object{{"camera_id", m_cameraId},
+        {"t", (double) (timestampUs / 1000)}, {"cells", base64Encode(bits)}}).dump();
+    std::thread([url, token, body, inFlight = m_motionInFlight]()
+        {
+            httpPostJson(url, body, token, 2);
+            *inFlight = false;
+        }).detach();
 }
 
 bool DeviceAgent::pushCompressedVideoFrame(Ptr<const ICompressedVideoPacket> frame)
