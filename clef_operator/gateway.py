@@ -40,6 +40,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import re
 import os
 import signal
 import subprocess
@@ -253,12 +254,61 @@ def finish(job: Job, result: dict) -> None:
         part.pending.done.set()
 
 
+class AutoTracking:
+    """A camera's own auto-tracking switch, an Nx analytics setting (Back PTZ: the Milesight engine's
+    ``AutoTracking.Enable``; there is no "people only"). The hunter keeps it off while it hunts and on while the camera
+    follows what it detected (``Hunter.tracking_wanted``); the operator's setting is restored when the hunter stops."""
+
+    def __init__(self, nx: Nx, camera_id: str, saved: Path | None = None) -> None:
+        self.nx, self.camera_id = nx, camera_id
+        self.engine, self.key, self.original = self._find()
+        self.state = self.original
+        # The operator's own setting, kept on disk: after a crash (no restore on the way out) the camera reads "off",
+        # the hunter's doing, and that must not become the setting to restore.
+        known = json.loads(saved.read_text()) if saved and saved.exists() else {}
+        if self.key and camera_id in known:
+            self.original = bool(known[camera_id])
+        elif self.key and saved:
+            saved.write_text(json.dumps({**known, camera_id: self.original}))
+        log(f"{camera_id[:8]}: camera auto-tracking switch: " + (f"{self.key} on engine {self.engine[:8]} (now {self.original})"
+                                                                  if self.key else "none found"))
+
+    def _find(self) -> tuple[str | None, str | None, bool | None]:
+        device = self.nx._request("GET", f"/rest/v4/devices/{self.camera_id}")
+        params = device.get("parameters", {})
+        engines = list(dict.fromkeys(  # top-level in Nx 6.1 (older Servers put them under parameters)
+            (device.get("userEnabledAnalyticsEngineIds") or params.get("userEnabledAnalyticsEngineIds") or [])
+            + (device.get("compatibleAnalyticsEngineIds") or params.get("compatibleAnalyticsEngineIds") or [])))
+        for engine in engines:
+            try:
+                values = self.nx.device_agent_settings(engine, self.camera_id).get("values", {})
+            except Exception:  # noqa: BLE001 - not every engine has settings for this camera
+                continue
+            for key, value in values.items():
+                if re.search(r"auto.?track", key, re.I) and key.lower().endswith("enable") and isinstance(value, bool):
+                    return engine, key, value
+        return None, None, None
+
+    def set(self, on: bool, why: str = "") -> None:
+        if self.key is None or on == self.state:
+            return
+        self.nx.set_device_agent_settings(self.engine, self.camera_id, {self.key: on})
+        self.state = on
+        why = why or ("following what it detected" if on else "off while the hunter hunts")
+        log(f"{self.camera_id[:8]}: camera auto-tracking {'on' if on else 'off'}: {why}")
+
+    def restore(self) -> None:
+        if self.original is not None:
+            self.set(self.original, "the operator's own setting, restored")
+
+
 class Gateway:
     def __init__(self, clef: Clef, max_pixels: int, profiles: ProfileStore | None = None,
                  state_dir: Path | None = None, embedder: Embedder | None = None) -> None:
         self.clef, self.max_pixels = clef, max_pixels
         self.embedder = embedder  # EmbeddingGemma for the PTZ hunters' cheap looks (embed.py); None: Clef only
         self.embed_maps: dict[str, EmbedMap] = {}  # camera -> what each direction looked like (embed_map.py)
+        self.trackers: dict[str, AutoTracking] = {}  # camera -> its own auto-tracking switch, if it has one
         self.state_dir = state_dir
         self.presets_path = (state_dir / "ptz_presets.json") if state_dir else None
         self.profiles = profiles or ProfileStore()
@@ -692,6 +742,13 @@ class Gateway:
         a hunter looks for hands the camera to its auto-tracking (``Hunter.camera_detected``)."""
         while True:
             time.sleep(every_s)
+            for camera_id, tracker in list(self.trackers.items()):  # hunters stopped: the operator's setting back
+                if camera_id not in self.hunters or self.hunters[camera_id].status.state in ("stopped", "error"):
+                    try:
+                        tracker.restore()
+                        del self.trackers[camera_id]
+                    except Exception:  # noqa: BLE001 - try again next time
+                        pass
             for camera_id, hunter in list(self.hunters.items()):
                 if hunter.status.state in ("stopped", "error", "waiting for PTZ") or not hunter.config.targets:
                     continue
@@ -709,6 +766,13 @@ class Gateway:
                     kind = detection_kind(type_id, hunter.config.targets)
                     if kind and now - last_seen <= fresh_s:
                         hunter.camera_detected(now, kind, str(track.get("id")), last_seen)
+                try:  # the camera's own tracking: on while it follows what it detected, off while the hunter hunts
+                    if camera_id not in self.trackers:
+                        self.trackers[camera_id] = AutoTracking(
+                            self.nx, camera_id, self.state_dir / "autotracking.json" if self.state_dir else None)
+                    self.trackers[camera_id].set(hunter.tracking_wanted(now))
+                except Exception as error:  # noqa: BLE001 - the Server may be restarting: try again next time
+                    log(f"{camera_id[:8]}: auto-tracking switch failed: {error!r}"[:200])
 
     def hunter_search(self, camera_id: str, text: str = "", top: int = 8) -> dict:
         """Plain-text search over what a PTZ hunter has seen: every map entry's similarity and the best matches. No
@@ -918,6 +982,11 @@ def main() -> None:
         # A hunter killed mid-move would leave the PTZ motor running in continuous mode: stop every motor first.
         # The hunter configs stay saved, so the next start resumes them.
         gateway.save_dashboard()
+        for camera_id, tracker in list(gateway.trackers.items()):
+            try:
+                tracker.restore()  # the operator's own auto-tracking setting, as it was
+            except Exception as error:  # noqa: BLE001
+                log(f"{camera_id[:8]}: could not restore auto-tracking: {error!r}")
         for camera_id, hunter in list(gateway.hunters.items()):
             hunter._stop.set()
             try:

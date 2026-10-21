@@ -98,7 +98,15 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
   the hunter asks each tile of a promising wide view the helpers; a tile that stands out (at least 0.5, and 0.25
   above the view's median tile) becomes a zoomed view at half the field of view, learned like any other. On Back PTZ
   at pan 190 the picnic-table tiles stood out at 0.90-0.95 and the path tiles at 0.72-0.75.
-- The hunter pans and tilts slowly (loud motors) but zooms in one step (silent): out before a pan, in after it. After
+- The hunter pans and tilts slowly (loud motors) and zooms quickly (silent): out before a pan, in after it. A zoom is
+  one continuous command, timed, then a stop. Back PTZ zooms at one rate whatever the speed asked (about 10.5 degrees
+  a second wide, 5 near 9 degrees; the time from a to b degrees is about 0.6 x |a^0.6 - b^0.6| s, fitted to zooms in
+  from wide) and reads back a second or more late, so steering by the readback overshot by about 40% and each
+  correction overshot back (13 <-> 25 degrees). It does not correct afterwards, and a zoom within 15% of the field of
+  view already set is skipped. It used
+  absolute zooms, but Back PTZ kept working on an absolute zoom-out after the pan that followed it cut it short, and
+  zoomed itself in to 4-5 degrees with no further command (11:35 and 11:38 on 20 October: 37 to 3.7 degrees in 3 s,
+  onto the lawn). That, not auto-tracking, was the close-up "fixation" on grass. After
   any zoom it sends nothing for `focus_s` (default 4 s, camera page "Focus time after zooming") while the camera
   refocuses. It decides its own zoom (a fixed share of time zoomed out, the earlier setting, kept it close up on
   schedule whether or not there was anything to look closer at). Wide is its stance: a wide view takes in the most.
@@ -116,7 +124,14 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
   scores never rule them out. First run
   (17:08): wide for 5 minutes, bored, 3 close-up spots in 2 minutes, wide again. Where a move arrived is judged
   once the zoom reads back as asked: a second after zooming in to 9 degrees Back PTZ still read 37, and the close-up
-  look was learned as a look at the wide view it came from.
+  look was learned as a look at the wide view it came from. Look-around close-ups are never tighter than 14 degrees
+  and only where the distance calls for at least three quarters of that zoom; tighter ones are for evidence (Clef
+  unsure, motion, the camera's detection). A view the camera reached zoomed in further than asked is learned at the
+  field of view asked for, and learned views tighter than the minimum with no finds are dropped on load: each
+  self-zoom had been learned as a new close-up and revisited, a ratchet that grew 72 views at 3-5 degrees.
+- It holds a wide view it is worth watching (promising, not mostly unwanted) instead of hopping, and choosing the next
+  view counts any view within half a field of view of a recent one as the same place: it used to ping-pong between
+  neighbouring lawn views a few degrees apart.
 - When the Server stops answering mid-hunt (a restart), the hunter stops the motor, waits for the PTZ and carries on.
 - The hunter gets bored of places too:
   each recent visit (fading over 10 minutes) scales the appeal of nearby views by 0.4 (up to four visits' worth), so
@@ -158,8 +173,7 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
   continuous speed 0.2. Its tilt end stop is +5 logical degrees (`tilt_max`); driven up into it, it pans by itself.
   The hunter stops a stalled axis, corrects in slower passes, and learns each view where the camera really ended up.
 - Back PTZ sometimes ignores a continuous command that sets one axis to zero and keeps panning at full speed; only
-  the full stop (0, 0, 0) is always obeyed. The hunter never changes one axis mid-move, and finishes the last few
-  degrees with an absolute move (exact, but it ignores its speed).
+  the full stop (0, 0, 0) is always obeyed. The hunter never changes one axis mid-move.
 - Back PTZ has an Nx PTZ home position (preset 300): the Server drives it home after about 5 idle minutes, e.g.
   while hunter questions wait in a busy Clef queue. The hunter checks the camera is still where it left it before
   each snapshot, and does not learn from one taken elsewhere.
@@ -183,8 +197,8 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
   click): the page uses the Desktop Client JavaScript API (`window.vmsApiInit`, then `vms.tab.state()` and
   `vms.tab.setItemParams(item, {media: {timestampMs, speed}})`; `addItem` if the camera is not on the layout),
   which needs the Web Page's "Allow using Client API" (the pages are created with it).
-- The hunter never jumps: pan and tilt move only in slow continuous passes (to within 2 degrees); only zoom, which
-  is silent, uses absolute moves. While it holds still it sends a stop command every 60 s: the Server otherwise sends
+- The hunter never jumps and sends no absolute moves: pan and tilt move only in slow continuous passes (to within 2
+  degrees), zoom in quick continuous ones. While it holds still it sends a stop command every 60 s: the Server otherwise sends
   an idle PTZ to its home position at full speed after about 5 minutes (tested: with the keep-alive it stayed put).
 - EmbeddingGemma 2 (`google/embeddinggemma-2`, text and image encoders, bf16, 70 soft tokens an image) runs next to
   Clef on the DGX (`scripts/embed.sh`, port 8300, 0.9 GB): one look (frame, 9 tiles cut by the server, a thumbnail)
@@ -221,7 +235,15 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
   `AutoTracking.Enable` is on) whose kind matches a "Look for" description ("person" also matches people, human,
   pedestrian...; "a van" matches Vehicle) is a find at the current view, and the camera's auto-tracking takes over:
   the hunter stops at once, even mid-move, and sends nothing while the camera keeps reporting the track, plus the
-  take-back time.
+  take-back time. The camera's auto-tracking is switched off while the hunter hunts (it would chase things from
+  views the hunter only passes through) and on while it follows a detection; the gateway finds the switch among the
+  camera's analytics engine settings (`AutoTracking.Enable` on Back PTZ), keeps the original setting in
+  `~/.clef_operator/autotracking.json` and restores it when the hunter stops or the gateway shuts down (or, after a
+  crash, on the next start). Tracking stays on, and the hunter keeps its hands off, until 30 s after the last
+  detection and after the camera last moved by itself: Back PTZ's person tracks last 1-8 s and break up while it
+  follows someone, and switched off 10 s after the last one, its tracking was cut off mid-follow every time
+  (15:41, 15:42 and 18:06 on 20 October; every one of the day's 8 person tracks did reach the hunter). The
+  60 s runaway stop does not apply while it follows.
 - Motion while the camera holds still. The plugin streams the Server's motion grid (44 x 32, OR-ed over half a
   second) to the gateway (`POST /v1/motion`) for hunter cameras, 2 a second. The hunter uses it only when the PTZ
   is still (not moving, refocusing, settling or handed over). Per view it learns each cell's share of frames with
@@ -230,7 +252,24 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
   before) or moves fast (1.5 cells a second); nothing counts until the view has been watched 30 s. Action cuts the
   hold short: the hunter goes there at full motor speed (no slow approach, no rest), zoomed for the motion's size and
   distance, and Clef looks. Where action was pulls the hunter's choice of view for half an hour, twice as much at
-  night (19:00-07:00), when embeddings and Clef see less. At most one chase every 30 s.
+  night (19:00-07:00), when embeddings and Clef see less, but only action after which someone was found there
+  pulls: chases of leaves found nobody, and pulling back to them kept the camera on infrared-lit trees after dark.
+  A view first reached by a chase starts as promising as the known view nearest it, not as an unscored one (0.5,
+  5-10 times the yard views around it). At most one chase every 30 s. Motion at or above the
+  horizon is never chased (all of it above, or centred less than 2 degrees below): from a camera mounted above head
+  height every person on the ground is below it, centred 2 degrees below at 75 m from 3.5 m up, so up there are
+  only treetops, sky and rooflines (a tree line at tilt +2 drew a chase that zoomed in to 4.5 degrees, its foot at
+  tilt 0 and -1.5 others to 6 and 14). The camera's own detections still find people further out.
+  Leaves, bushes and shadows are learned by direction, not only per view (`action.NuisanceMap`, kept with the
+  hunter's memory across restarts): every still frame teaches how often each 1-degree direction moves (6% of frames or more is
+  a nuisance: gusty leaves moved in 9-11%), so leaves
+  learned from one view are known from every view that overlaps it (each view learning its own took minutes at
+  that view, and the hunter holds a view 20-45 s); and each chase that found nobody counts against its direction,
+  fading over a day, so after two recent ones motion within about a metre of it on the ground (5 degrees out in
+  the yard, 10-13 below the camera, where a bush spans far more) is not chased again until something
+  is found there (gusts move leaves too seldom to count as busy, but each looked new: on Back PTZ the same far
+  yard and bush spots drew a chase every few minutes, Clef 0.01 each time). The camera's own detections are
+  never filtered.
 - What not to look at. Each look's frame and its 9 tiles are classified (embed.ContentModel) as tree, bush, sky,
   siding (a house wall, window or door, a fence post close up), roof (or a pergola or lattice from above), grass or
   yard, from class descriptions plus the camera's own labelled images (7 nearest), on 256 of the 768 dimensions

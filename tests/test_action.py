@@ -59,3 +59,31 @@ def test_the_learned_view_survives_a_restart():
 def test_the_box_grows_round_the_cluster_and_stays_in_the_frame():
     x, y, w, h = box({(43, 31)})
     assert 0.0 <= x and x + w <= 1.0 and 0.0 <= y and y + h <= 1.0 and w > 0 and h > 0
+
+
+def test_leaves_learned_from_one_view_are_a_nuisance_from_an_overlapping_one():
+    from clef_operator.action import NuisanceMap
+    from clef_operator.hunter import View
+    nuisance = NuisanceMap()
+    here, next_door = View(190.0, -10.0, 37.0), View(200.0, -10.0, 37.0)  # 10 degrees apart: they overlap
+    leaves = {(c, r) for c in range(36, 40) for r in range(14, 18)}  # right of centre at 190: about pan 202
+    for i in range(200):
+        nuisance.observe(here, leaves if i % 3 == 0 else set())  # moving a third of the time
+    busy = nuisance.busy(next_door)
+    assert busy and all(abs(c - 25) <= 4 for c, _ in busy)  # the same leaves, just right of centre from 200
+    assert not nuisance.busy(View(250.0, -10.0, 37.0))  # nowhere else
+
+
+def test_the_nuisance_map_and_its_fruitless_chases_survive_a_restart():
+    from clef_operator.action import NuisanceMap
+    from clef_operator.hunter import View
+    nuisance = NuisanceMap()
+    for i in range(100):
+        nuisance.observe(View(190.0, -10.0, 37.0), {(10, 10)} if i % 2 else set())
+    nuisance.chased(1000.0, 200.0, -22.0)
+    nuisance.chased(1100.0, 201.0, -23.0)
+    again = NuisanceMap.from_json(nuisance.to_json())
+    assert again.cells == nuisance.cells and again.busy(View(190.0, -10.0, 37.0)) == nuisance.busy(View(190.0, -10.0, 37.0))
+    assert again.fruitless(1200.0, 200.5, -22.5, found_since=0.0) > 1.9
+    assert again.fruitless(1200.0, 200.5, -22.5, found_since=1050.0) < 1.1  # someone found there in between
+    assert again.fruitless(1200.0 + 2 * 86400, 200.5, -22.5, found_since=0.0) < 0.6  # fades over days

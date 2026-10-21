@@ -1,10 +1,11 @@
 import json
+import math
 import time
 
 import pytest
 
 from clef_operator.hunter import (
-    CUE_RESCAN_S, DEFAULT_CUES, ExternalControl, camera_medians, hopeless, merge_duplicates, obeys, same_spot, FOV_RATE, MEMORY_VERSION, PAN_RATE, cue_boost, standout_tiles, zoom_on, QUIET_RECHECK_S, is_quiet, resting, sightings, TILT_RATE, DEFAULT_AVOID, Hunter, HunterConfig, View, ViewStats, aim_at,
+    CUE_RESCAN_S, DEFAULT_CUES, ExternalControl, camera_medians, hopeless, merge_duplicates, obeys, same_spot, FOV_RATE, MEMORY_VERSION, PAN_RATE, cue_boost, standout_tiles, zoom_on, QUIET_RECHECK_S, is_quiet, resting, sightings, TILT_RATE, TRACK_HOLD_S, ZOOM_TIME, zoom_seconds, DEFAULT_AVOID, Hunter, HunterConfig, View, ViewStats, aim_at,
     angle_delta, choose_next, likelihood_questions, move_slowly, prior_from, survey_views, tile_boxes,
 )
 
@@ -35,7 +36,7 @@ class FakePtz:
         if self.sticky and any(new):
             new = tuple(n if n or not o else o for n, o in zip(new, self.speed))
         self.speed = new
-        self.max_speed_used = max(self.max_speed_used, abs(pan), abs(tilt), abs(zoom))
+        self.max_speed_used = max(self.max_speed_used, abs(pan), abs(tilt))  # the motors: zoom is silent
 
     def absolute(self, view):
         self.commands.append((self.now, "absolute"))
@@ -52,7 +53,9 @@ class FakePtz:
         if self.tilt > self.tilt_max:  # like Back PTZ: driven up into the end stop, it pans by itself
             self.tilt = self.tilt_max
             self.pan -= 6.0 * seconds
-        self.fov -= self.speed[2] * FOV_RATE * seconds  # zoom in narrows the field of view
+        if self.speed[2]:  # like Back PTZ: one zoom rate whatever the speed, slower zoomed in (see zoom_seconds)
+            travel = math.copysign(seconds / ZOOM_TIME, -self.speed[2])  # zoom in narrows the field of view
+            self.fov = max(1.0, self.fov ** 0.6 + travel) ** (1 / 0.6)
         self.now += seconds
 
 
@@ -201,8 +204,6 @@ def test_a_good_view_across_the_yard_beats_bouncing_between_two_neighbours():
              neighbour: ViewStats(prior=0.54, visits=3, last_visit=2960.0),
              lawn: ViewStats(prior=0.56, visits=1, last_visit=1000.0)}  # due a look: over half an hour ago
     assert choose_next(stats, here, now=3000.0, hour=9, magnets=[neighbour], since_magnet_s=40.0) == lawn
-    assert choose_next(stats, here, now=3000.0, hour=9, magnets=[neighbour], since_magnet_s=40.0,
-                       travel_weight=0.01) == neighbour  # the old travel cost: 79 degrees was never worth it
 
 
 def test_magnets_pull_harder_the_longer_the_hunter_is_away():
@@ -563,22 +564,26 @@ def test_views_saved_before_avoid_weighting_are_scored_again():
     assert not s.scored and s.avoid == 0.0  # visited (not vetoed) and asked again
 
 
-def test_zooming_is_one_quick_step_after_a_slow_pan_and_then_the_camera_refocuses():
+def test_zooming_is_continuous_after_a_slow_pan_and_then_the_camera_refocuses():
     ptz = FakePtz(View(184.0, -12.0, 37.0))
+    sent = []
+    real = ptz.continuous
+    def continuous(pan, tilt, zoom):
+        sent.append((ptz.now, pan, tilt, zoom))
+        real(pan, tilt, zoom)
+    ptz.continuous = continuous
     hunter = Hunter(HunterConfig("cam", focus_s=4.0, settle_s=1.0, rest_s=0.0), ptz, lambda *a: {},
                     sleep=ptz.sleep, clock=lambda: ptz.now)
     arrived = hunter._go(View(200.0, -15.0, 18.5))
-    assert arrived == View(200.0, -15.0, 18.5)
-    absolute_times = [t for t, kind in ptz.commands if kind == "absolute"]
-    zoom_index = next(i for i, v in enumerate(ptz.absolute_moves) if v.fov == 18.5)
-    zoom, zoom_at = ptz.absolute_moves[zoom_index], absolute_times[zoom_index]
-    assert abs(zoom.pan - 200.0) <= 2.0 and abs(zoom.tilt + 15.0) <= 2.0  # centred first (slowly), then zoomed
-    assert all(v.fov == 37.0 for v in ptz.absolute_moves[:zoom_index])  # the pan itself stayed wide
-    assert ptz.now - zoom_at >= 4.0 + 1.0  # focus and settle before anything else happens
-    before = len(ptz.absolute_moves)
+    assert abs(arrived.pan - 200.0) <= 2.0 and abs(arrived.fov - 18.5) <= 2.5
+    assert not ptz.absolute_moves  # never an absolute move: the camera finished them on its own, zoomed in
+    assert not any(z and (p or t) for _, p, t, z in sent)  # zoom and pan never together
+    last_pan = max(t for t, p, ti, z in sent if p or ti)
+    first_zoom = min(t for t, p, ti, z in sent if z)
+    assert first_zoom >= last_pan  # centred first (slowly), then zoomed in
+    sent.clear()
     hunter._go(View(150.0, -10.0, 37.0))
-    zoom_out = ptz.absolute_moves[before]
-    assert zoom_out.fov == 37.0 and abs(zoom_out.pan - 200.0) <= 2.0  # widened first, then the pan
+    assert min(t for t, p, ti, z in sent if z) <= min(t for t, p, ti, z in sent if p or ti)  # widened, then the pan
 
 
 def test_no_commands_are_sent_while_the_camera_refocuses():
@@ -631,7 +636,7 @@ def test_a_tile_much_more_like_what_it_looks_for_is_zoomed_in_on_then_the_hunter
     assert hunter.zoom_reason == ""  # done: the next move is wide again
 
 
-def test_zoomed_views_can_be_scanned_for_a_second_zoom_level():
+def test_tour_close_ups_never_go_a_second_level_tighter_than_14_degrees():
     ptz = FakePtz()
     cfg = HunterConfig("cam", cues=["path", "seat", "yard"], camera_height_m=7.4)  # high enough that these tiles are far
     by_tile = {}
@@ -650,17 +655,17 @@ def test_zoomed_views_can_be_scanned_for_a_second_zoom_level():
     closer = View.of(175.0, -5.0, 18.5)
     hunter.stats[closer] = ViewStats(prior=0.8, found_by="play area")
     hunter._scan_tiles(closer, b"jpeg")
-    assert any(6.0 <= v.fov <= 12.0 for v, s in hunter.stats.items() if s.found_by in ("seat", "path"))
+    # From an 18.5 degree close-up, the next level would be 9: tight zooms are for evidence, not touring
+    assert not any(v.fov < 14.0 for v, s in hunter.stats.items() if s.found_by in ("seat", "path"))
 
 
-def test_only_zoom_ever_uses_an_absolute_move():
+def test_the_hunter_never_sends_an_absolute_move():
     ptz = FakePtz(View(184.0, -12.0, 37.0), lag=1.0)
     hunter = Hunter(HunterConfig("cam", rest_s=0.0, settle_s=1.0, focus_s=4.0), ptz, lambda *a: {},
                     sleep=ptz.sleep, clock=lambda: ptz.now)
     for view in (View(248.5, -41.5, 37.0), View(184.0, -12.0, 37.0), View(190.0, -10.0, 18.5), View(72.0, -10.0, 37.0)):
         hunter._go(view)
-    assert all(v.fov != prev for v, prev in zip(ptz.absolute_moves, [37.0] + [v.fov for v in ptz.absolute_moves]))
-    assert [v.fov for v in ptz.absolute_moves] == [18.5, 37.0]  # zoom in, zoom out: nothing else jumps
+    assert ptz.absolute_moves == []
 
 
 def test_keepalive_sends_a_stop_only_when_idle_and_never_while_refocusing_or_moving():
@@ -723,9 +728,10 @@ def test_boredom_moves_the_hunter_on_from_an_area_it_has_been_watching():
     stats = {lawn_a: ViewStats(prior=0.6, visits=40, last_visit=900.0), lawn_b: ViewStats(prior=0.6, visits=40, last_visit=900.0),
              playground: ViewStats(prior=0.55, visits=40, last_visit=900.0)}
     kw = dict(now=1000.0, hour=9, exploration=0.0)
-    assert choose_next(stats, lawn_a, **kw) == lawn_b  # not bored yet: the nearby equally good view
-    recent = [(1000.0 - 25 * i, lawn_a if i % 2 else lawn_b) for i in range(12)]  # five minutes around the lawn
-    assert choose_next(stats, lawn_a, recent=recent, **kw) == playground
+    # lawn_b is 9 degrees from lawn_a: the same picture, so the hunter goes somewhere new, not back and forth
+    assert choose_next(stats, lawn_a, **kw) == playground
+    recent = [(1000.0 - 25 * i, playground) for i in range(12)]  # five minutes at the playground
+    assert choose_next(stats, playground, recent=recent, **kw) in (lawn_a, lawn_b)
 
 
 
@@ -862,18 +868,13 @@ def test_a_look_at_a_view_learned_a_few_degrees_off_is_not_a_hand_over():
 
 
 def test_after_a_zoom_the_hunter_waits_for_the_zoom_to_read_back_before_watching():
-    class LateZoom(FakePtz):  # 11:54:57: the zoom-out still read 15.7 degrees after the focus pause
-        def absolute(self, view):
-            seen, at = self._seen, self._seen_at
-            super().absolute(view)
-            self._seen, self._seen_at = seen, at  # the readback does not refresh at once
-    ptz = LateZoom(View(185.8, -13.7, 15.7), lag=3.0)
+    ptz = FakePtz(View(185.8, -13.7, 15.7), lag=1.0)  # Back PTZ refreshes its position about once a second
     ptz.position()
     hunter = Hunter(HunterConfig("cam", settle_s=0.0, focus_s=0.0), ptz, lambda *a: {}, sleep=ptz.sleep,
                     clock=lambda: ptz.now)
     hunter.home = View(185.8, -13.7, 36.9)
     hunter._go(View(185.8, -13.7, 36.9))
-    assert abs(hunter._expected.fov - 36.9) < 0.5  # where the zoom settled, not the late reading
+    assert abs(hunter._expected.fov - 36.9) < 2.5  # where the zoom settled
     assert not hunter._watch(ptz.now)
 
 
@@ -1138,6 +1139,111 @@ def test_action_in_the_distance_while_still_is_chased_quickly_and_zoomed_in_on()
     assert "motion" in hunter.zoom_reason
 
 
+def test_motion_above_the_horizon_is_treetops_or_sky_and_never_chased():
+    from clef_operator.action import MIN_SEEN
+    hunter, ptz, view = _still_hunter()  # tilt -5, 37 degrees wide: the top of the frame is about 9 degrees up
+    t = 0.0
+    for _ in range(MIN_SEEN + 10):
+        hunter.motion_frame(t, set())
+        t += 0.5
+    treetop = {(30, 1), (30, 2), (31, 1), (31, 2)}  # a tree line waving, high in the frame
+    hunter.motion_frame(t, treetop)
+    hunter.motion_frame(t + 0.5, {(c + 1, r) for c, r in treetop})
+    assert hunter._action is None and not hunter.activity
+    t += 60.0
+    for _ in range(12):
+        hunter.motion_frame(t, set())
+        t += 0.5
+    foot = {(30, 10), (30, 11), (31, 10), (31, 11)}  # the foot of the tree line, centred about on the horizon
+    hunter.motion_frame(t, foot)
+    hunter.motion_frame(t + 0.5, {(c + 1, r) for c, r in foot})
+    assert hunter._action is None and not hunter.activity
+
+
+def test_motion_that_keeps_coming_back_to_one_spot_with_nobody_there_stops_drawing_chases():
+    from clef_operator.action import MIN_SEEN
+    hunter, ptz, view = _still_hunter()
+    t = 0.0
+    for _ in range(MIN_SEEN + 10):
+        hunter.motion_frame(t, set())
+        t += 0.5
+    bush = {(30, 20), (30, 21), (31, 20), (31, 21)}  # below the horizon: a bush in the wind
+    chases = 0
+    for gust in range(4):
+        t += 120.0  # a gust every two minutes, quiet in between
+        for _ in range(12):
+            hunter.motion_frame(t, set())
+            t += 0.5
+        hunter._action = None
+        hunter.motion_frame(t, bush)
+        hunter.motion_frame(t + 0.5, {(c + 1, r) for c, r in bush})
+        chases += hunter._action is not None
+        t += 1.0
+    assert chases == 2  # twice, then it is known as the wind
+    # Someone found there since: it counts again.
+    hunter.stats[view].last_yes = t
+    t += 120.0
+    for _ in range(12):
+        hunter.motion_frame(t, set())
+        t += 0.5
+    hunter.motion_frame(t, bush)
+    hunter.motion_frame(t + 0.5, {(c + 1, r) for c, r in bush})
+    assert hunter._action is not None
+
+
+def test_fruitless_chases_are_remembered_across_a_restart(tmp_path):
+    ptz = FakePtz(View(190.0, -5.0, 36.9))
+    memory = tmp_path / "hunter.json"
+    hunter = Hunter(HunterConfig("cam", settle_s=0.0), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now,
+                    memory=memory)
+    hunter.stats[View(190.0, -5.0, 37.0)] = ViewStats(prior=0.5)
+    hunter.nuisance.chased(100.0, 200.0, -22.0)
+    hunter.nuisance.chased(200.0, 200.5, -22.5)
+    hunter._save()
+    again = Hunter(HunterConfig("cam", settle_s=0.0), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now,
+                   memory=memory)
+    again._load()
+    assert again._fruitless(300.0, View(200.0, -22.0, 37.0))  # the leaves there are still known after the restart
+    assert not again._fruitless(300.0, View(150.0, -10.0, 37.0))
+    # Below the camera a bush spans many degrees: chases 7 degrees apart there are the same place; out in the yard not.
+    again.nuisance.chased(400.0, 238.0, -26.5)
+    again.nuisance.chased(500.0, 231.5, -33.0)
+    assert again._fruitless(600.0, View(237.0, -31.0, 37.0))
+    again.nuisance.chased(400.0, 150.0, -4.0)
+    again.nuisance.chased(500.0, 157.0, -4.0)
+    assert again._fruitless(600.0, View(153.5, -4.0, 37.0))  # within 5 degrees of both
+    assert not again._fruitless(600.0, View(145.5, -4.0, 37.0))  # out in the yard the radius stays 5 degrees: one chase
+
+
+def test_a_view_first_reached_by_a_chase_is_as_promising_as_its_neighbour_not_a_fresh_one():
+    hunter, ptz, view = _still_hunter()
+    hunter.stats[view] = ViewStats(prior=0.06, avoid=0.7)  # watched for weeks: little there, mostly trees at night
+    landed = View(198.0, -9.0, 37.0)  # where a leaf chase centred the camera, 8 degrees off it
+    fresh = hunter._new_stats(landed)
+    assert fresh.prior == 0.06 and fresh.avoid == 0.7  # not 0.5: five to ten times the yard views it came from
+    assert hunter._new_stats(View(300.0, -10.0, 37.0)).prior == ViewStats().prior  # nothing known near: unscored
+
+
+def test_views_left_by_chases_at_the_unscored_prior_are_rescored_from_their_neighbours_on_load(tmp_path):
+    ptz = FakePtz(View(190.0, -5.0, 36.9))
+    memory = tmp_path / "hunter.json"
+    hunter = Hunter(HunterConfig("cam"), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now, memory=memory)
+    yard, landed = View(190.0, -5.0, 37.0), View(198.0, -9.0, 37.0)
+    hunter.stats = {yard: ViewStats(prior=0.06, visits=400), landed: ViewStats(visits=1)}  # a leaf chase's view, 0.5
+    hunter._save()
+    again = Hunter(HunterConfig("cam"), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now, memory=memory)
+    again._load()
+    assert {v: s.prior for v, s in again.stats.items()} == {yard: 0.06, landed: 0.06}
+
+
+def test_only_action_where_someone_was_then_found_pulls_the_choice_of_views():
+    hunter, ptz, view = _still_hunter()
+    leaves, person = View(198.0, -9.0, 37.0), View(175.0, -6.0, 37.0)
+    hunter.activity.extend([(100.0, leaves), (200.0, person)])
+    hunter.stats[View(176.0, -6.0, 37.0)] = ViewStats(prior=0.3, last_yes=210.0)  # found after the second chase
+    assert hunter._fruitful_activity() == [(200.0, person)]
+
+
 def test_motion_while_the_camera_moves_or_is_handed_over_is_ignored():
     hunter, ptz, view = _still_hunter()
     hunter._handed_over_until = 1e9
@@ -1150,9 +1256,9 @@ def test_a_camera_detection_is_a_find_and_hands_the_camera_to_its_auto_tracking(
     hunter, ptz, view = _still_hunter()
     hunter.camera_detected(1000.0, "Person", "track-1", last_seen=1000.0)
     assert hunter.stats[view].total_hits == 1 and hunter._yield
-    assert hunter._handed_over_until == 1000.0 + hunter.config.handback_s
+    assert hunter._handed_over_until == 1000.0 + max(hunter.config.handback_s, TRACK_HOLD_S)
     hunter.camera_detected(1030.0, "Person", "track-1", last_seen=1030.0)  # still tracking it
-    assert hunter._handed_over_until == 1030.0 + hunter.config.handback_s and hunter.stats[view].total_hits == 1
+    assert hunter._handed_over_until == 1030.0 + max(hunter.config.handback_s, TRACK_HOLD_S) and hunter.stats[view].total_hits == 1
 
 
 def test_a_move_under_way_stops_when_the_camera_detects_the_target():
@@ -1234,3 +1340,123 @@ def test_close_ups_learned_before_the_content_check_are_classified_from_the_map(
     hunter.stats[lawn] = ViewStats(prior=0.9)
     hunter._classify_close_ups()
     assert hunter.stats[lawn].dull == pytest.approx(0.7)  # the fake: mostly lawn
+
+
+
+def test_two_neighbouring_lawn_views_do_not_pull_the_hunter_back_and_forth():
+    # 09:53 on Back PTZ: home (184/-12, a magnet) and 175/-10 (three finds) alternated every 15 s, 8 degrees apart.
+    home, neighbour, fence = View(184.0, -12.0, 37.0), View(175.0, -10.0, 37.0), View(249.0, -30.0, 37.0)
+    stats = {home: ViewStats(prior=0.5, visits=50, last_visit=990.0),
+             neighbour: ViewStats(prior=0.5, visits=50, last_visit=970.0, hits={9: 3}),
+             fence: ViewStats(prior=0.45, visits=50, last_visit=700.0)}
+    kw = dict(now=1000.0, hour=9, exploration=0.0, magnets=[home], since_magnet_s=10.0)
+    assert choose_next(stats, home, **kw) == fence
+
+
+def test_every_worthwhile_wide_view_is_watched_but_not_hopeless_ones():
+    hunter = Hunter(HunterConfig("cam"), FakePtz(), lambda *a: {})
+    assert hunter._worth_watching(ViewStats(prior=0.1))
+    assert not hunter._worth_watching(ViewStats(avoid=0.9))
+    assert not hunter._worth_watching(ViewStats(scored=True, unwanted=0.9))
+
+
+def test_a_close_up_read_back_tighter_than_asked_is_learned_at_the_zoom_asked_for():
+    class TightReadback(FakePtz):  # Back PTZ: asked for 6 degrees, it reads about 3.5
+        def position(self):
+            v = super().position()
+            return View(v.pan, v.tilt, 3.5) if v.fov < 7.0 else v
+    ptz = TightReadback(View(175.0, -4.0, 36.9))
+    hunter = Hunter(HunterConfig("cam", settle_s=0.0, focus_s=0.0), ptz, lambda *a: {}, sleep=ptz.sleep,
+                    clock=lambda: ptz.now)
+    hunter.home = View(184.0, -12.0, 36.9)
+    arrived = hunter._go(View(175.0, -4.0, 6.0))
+    assert arrived.fov == 6.0 and not any(v.fov < 6.0 for v in hunter.stats)
+
+
+def test_views_left_tighter_than_the_hunter_zooms_are_dropped_at_start(tmp_path):
+    memory = tmp_path / "hunter.json"
+    rows = [{"pan": 175.0, "tilt": -4.0, "fov": 3.5, "stats": ViewStats(visits=20).to_json()},
+            {"pan": 176.0, "tilt": -4.0, "fov": 4.0, "stats": ViewStats(visits=2, hits={9: 1}).to_json()},
+            {"pan": 184.0, "tilt": -12.0, "fov": 37.0, "stats": ViewStats(visits=50).to_json()}]
+    memory.write_text(json.dumps({"version": MEMORY_VERSION, "home": None, "views": rows}))
+    hunter = Hunter(HunterConfig("cam"), FakePtz(), lambda *a: {}, memory=memory)
+    hunter._load()
+    assert {v.fov for v in hunter.stats} == {4.0, 37.0}  # the one with a find is kept
+
+
+def test_the_cameras_tracking_is_wanted_only_while_it_follows_what_it_detected():
+    hunter, ptz, view = _still_hunter()
+    assert not hunter.tracking_wanted(1000.0)  # hunting: tracking off, or panning sets it chasing the scene
+    hunter.camera_detected(1000.0, "Person", "t1", last_seen=1000.0)
+    assert hunter.tracking_wanted(1000.0 + hunter.config.handback_s + 5.0)  # tracks last seconds: hold on past them
+    assert not hunter.tracking_wanted(1000.0 + TRACK_HOLD_S + 1.0)  # lost them: back to hunting
+
+
+def test_the_cameras_tracking_stays_on_while_the_camera_follows_someone_after_their_track_ends():
+    ptz = FakePtz(View(190.0, -5.0, 36.9))
+    hunter = Hunter(HunterConfig("cam", settle_s=0.0, handback_s=10.0), ptz, lambda *a: {}, sleep=ptz.sleep,
+                    clock=lambda: ptz.now)
+    hunter._expected = ptz.position()
+    hunter.camera_detected(ptz.now, "Person", "t1", last_seen=ptz.now)  # a 2 s track, then nothing more from Nx
+    start = ptz.now
+    ptz.speed = (0.03, 0.0, 0.0)  # the camera's tracker following them across the yard, for 90 s
+    for _ in range(45):
+        ptz.sleep(2.0)
+        hunter._watch(ptz.now)
+        assert hunter.tracking_wanted(ptz.now) and ptz.now < hunter._handed_over_until  # never cut off mid-follow
+    assert ptz.now - start >= 90.0 and ptz.speed != (0.0, 0.0, 0.0)  # and not stopped as a runaway after 60 s
+    ptz.speed = (0.0, 0.0, 0.0)  # it lost them and stopped
+    for _ in range(20):
+        ptz.sleep(2.0)
+        hunter._watch(ptz.now)
+    assert not hunter.tracking_wanted(ptz.now) and ptz.now >= hunter._handed_over_until  # back to hunting
+
+
+def test_after_stopping_a_move_nobody_asked_for_the_hunter_stops_holding_and_moves_on():
+    ptz = FakePtz(View(200.0, -10.0, 36.9))
+    hunter = Hunter(HunterConfig("cam", handback_s=10.0), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now)
+    hunter.status.view = View(184.0, -12.0, 37.0)
+    hunter._handed_over(ptz.now, ptz.position())
+    ptz.speed = (0.05, 0.0, 0.0)  # the camera's tracker panning off somewhere
+    for _ in range(32):
+        ptz.sleep(2.0)
+        hunter._watch(ptz.now)
+    assert ptz.speed == (0.0, 0.0, 0.0) and hunter.status.view is None and hunter._lost
+    hunter._arrived_at = ptz.now
+    start = ptz.now
+    hunter._hold()
+    assert ptz.now == start  # no holding on at a view it is not at
+
+
+
+def test_old_close_ups_much_tighter_than_their_distance_needs_are_skipped():
+    from clef_operator.hunter import distant_zoom
+    now = [1000.0]
+    hunter = Hunter(HunterConfig("cam"), FakePtz(), lambda *a: {}, clock=lambda: now[0])
+    hunter.home = View(184.0, -12.0, 37.0)
+    wide = View(190.0, -10.0, 37.0)
+    right = max(14.0, distant_zoom(View(169.0, -3.4, 14.0), hunter.config, 37.0))  # about 14 degrees, 57 m away
+    too_tight, fitting = View(169.0, -3.4, 6.0), View(175.0, -3.4, round(right, 1))
+    hunter.stats = {wide: ViewStats(prior=0.6), too_tight: ViewStats(prior=0.9), fitting: ViewStats(prior=0.5)}
+    hunter._wide_since = 0.0
+    assert set(hunter._candidates()) == {fitting}
+
+
+def test_a_zoom_is_one_timed_command_even_with_a_late_readback_and_never_pumps():
+    ptz = FakePtz(View(172.0, -3.0, 36.9), lag=1.5)  # Back PTZ reads back a second or more late
+    zooms = []
+    real = ptz.continuous
+    def continuous(pan, tilt, zoom):
+        if zoom:
+            zooms.append(zoom)
+        real(pan, tilt, zoom)
+    ptz.continuous = continuous
+    hunter = Hunter(HunterConfig("cam", settle_s=0.0, focus_s=0.0), ptz, lambda *a: {}, sleep=ptz.sleep,
+                    clock=lambda: ptz.now)
+    hunter._go(View(172.0, -3.0, 14.0))
+    assert zooms == [zooms[0]] and zooms[0] > 0  # one zoom in, never back out
+    assert abs(ptz.fov - 14.0) / 14.0 < 0.15
+    assert abs(zoom_seconds(36.9, 12.7) - 2.5) < 0.1  # measured on Back PTZ: 36.9 to 12.7 degrees in 2.5 s
+    zooms.clear()
+    hunter._go(View(172.0, -3.0, 13.0))  # within 15%: close enough, no zoom at all
+    assert zooms == []

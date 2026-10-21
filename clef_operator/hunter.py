@@ -41,7 +41,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from . import embed as embedding
-from .action import ActionWatch, ViewMotion
+from .action import CHASE_RADIUS, CHASE_SPAN_M, NUISANCE_CHASES, ActionWatch, NuisanceMap, ViewMotion
 from .clef import choice, noul
 
 Answers = dict[str, dict[str, float]]
@@ -53,6 +53,16 @@ Crop = Callable[[bytes, float, float, float, float], bytes]  # (jpeg, x, y, w, h
 # ahead of the target; positions are always read back from the camera.
 PAN_RATE, TILT_RATE, FOV_RATE = 30.0, 17.5, 48.0
 PAN_TOL, TILT_TOL, FOV_TOL = 0.6, 0.6, 1.0
+# Zoom is timed, not steered by the readback: Back PTZ zooms at one rate whatever the continuous speed (0.05, 0.1 and
+# 0.2 all took 36.9 to 26.6 degrees in a second), about 10.5 degrees a second wide and 5 near 9 degrees, and reads back
+# a second or more late, so stopping when the reading arrived overshot by about 40% and each correction overshot back
+# (13 <-> 25 degrees, over and over). Measured: the time to zoom from a to b degrees is ZOOM_TIME * |a^0.6 - b^0.6|
+# (0.60 fits zooms in from wide: 0.66 landed 37 -> 14 at 11-12.5 degrees, three times).
+ZOOM_SPEED, ZOOM_TIME = 0.25, 0.60
+ZOOM_CLOSE = 0.15  # within 15% of the field of view wanted is close enough: no zoom, no correction
+HEAD_HEIGHT_M = 2.0  # a camera mounted higher than this sees every person on level ground below the horizon
+HORIZON_MARGIN_DEG = 2.0  # motion centred less than this below the horizon is not a person in the yard (from
+# 3.5 m up, only someone over 75 m away is centred that high; 1 degree let the foot of Back PTZ's tree line through)
 READBACK_LAG_S = 0.5  # the Server's position is refreshed about once a second: stop this much travel early
 STALL_S = 2.5  # a driven axis whose position has not changed for this long is at its end stop
 MEMORY_VERSION = 3  # older than 2: forgotten on load (other prompts, or positions never reached); 2: see _load
@@ -307,6 +317,7 @@ LOOK_AROUND_LOOKS = 3  # a look-around: this many close-up spots
 LOOK_AROUND_S = 120.0  # or this long, whichever comes first
 WATCH_DAY_S, WATCH_NIGHT_S = 20.0, 45.0  # a promising wide view is watched at least this long (motion, Clef)
 ACTION_COOLDOWN_S = 30.0  # at most one action chase this often
+TRACK_HOLD_S = 30.0  # the camera's tracking stays on this long after its last detection or its last move by itself
 ACTION_FRESH_S = 5.0  # action older than this is not chased
 ACTIVITY_HALF_LIFE_S = 1800.0  # where action was pulls the hunter back, fading over half an hour
 ACTIVITY_DAY, ACTIVITY_NIGHT = 0.4, 0.8  # and more at night, when embeddings and Clef see less
@@ -339,6 +350,8 @@ def is_night(hour: int) -> bool:
     return hour >= 19 or hour < 7
 
 
+TOUR_MIN_FOV = 14.0  # close-ups on a look-around are never tighter: tight zooms are for evidence (Clef, motion, a
+# detection), not for touring; at 6 degrees a tour stop was a patch of lawn
 TARGET_FRAME_SHARE = 1 / 6  # zoom so the target would be about this share of the frame's height
 ZOOM_WORTH = 0.7  # zoom only if that field of view is under this share of the wide one
 LOCALIZE_STANDOUT = 2 * LIKE_SPREAD  # a tile this much more like a look-for description than the usual view: zoom in
@@ -528,7 +541,9 @@ def choose_next(stats: dict[View, ViewStats], current: View | None, now: float, 
         # Curiosity in proportion to promise: an unvisited wall is not worth a look just for being unvisited.
         explore = exploration * value * math.sqrt(math.log(total_visits) / (s.visits + 1))
         travel = travel_weight * (view.distance(current) if current else 0.0)
-        repeat = 0.5 if current and view.distance(current) <= 3.0 else 0.0  # near copies count as staying put
+        # Within half a field of view of where it is, the picture hardly changes: that is staying put, not looking
+        # somewhere new (8 degrees apart, home and its neighbour on the lawn pulled it back and forth every 15 s).
+        repeat = 1.0 if current and view.distance(current) <= 0.5 * max(view.fov, current.fov) else 0.0
         pull = pull_strength * magnet_pull(view, magnets or [], magnet_radius) * (1.0 - s.avoid)  # home's area, not its wall
         hot = 0.0
         if s.total_hits:
@@ -617,7 +632,7 @@ def crop_jpeg(jpeg: bytes, x: float, y: float, w: float, h: float) -> bytes:
 class Ptz(Protocol):
     def position(self) -> View: ...  # logical: degrees and field of view
     def continuous(self, pan: float, tilt: float, zoom: float) -> None: ...
-    def absolute(self, view: View) -> None: ...  # a fast, exact move: only used for the last few degrees
+    def absolute(self, view: View) -> None: ...  # unused by the hunter: Back PTZ finishes them on its own, zoomed in
     def snapshot(self) -> bytes: ...
 
 
@@ -633,6 +648,8 @@ class NxPtz:
         self.nx.ptz_continuous(self.camera_id, pan, tilt, zoom)
 
     def absolute(self, view: View) -> None:
+        print(f"{time.strftime('%H:%M:%S')} hunter {self.camera_id[:8]} absolute move to pan {view.pan:.1f} tilt "
+              f"{view.tilt:.1f} fov {view.fov:.1f}", flush=True)  # logged: the hunter itself never sends one
         self.nx._request("POST", f"/rest/v4/devices/{self.camera_id}/ptz/position",
                          {"type": "logical", "pan": view.pan, "tilt": view.tilt, "zoom": view.fov, "speed": 0.1})
 
@@ -646,6 +663,15 @@ RATE = {"pan": PAN_RATE, "tilt": TILT_RATE, "fov": FOV_RATE}
 
 def _left(now: View, target: View) -> dict[str, float]:
     return {"pan": angle_delta(now.pan, target.pan), "tilt": target.tilt - now.tilt, "fov": target.fov - now.fov}
+
+
+def zoom_seconds(a: float, b: float) -> float:
+    """How long Back PTZ takes to zoom from ``a`` to ``b`` degrees of field of view (either way)."""
+    return ZOOM_TIME * abs(max(a, 0.1) ** 0.6 - max(b, 0.1) ** 0.6)
+
+
+def zoom_close(a: float, b: float) -> bool:
+    return abs(math.log(max(a, 0.1) / max(b, 0.1))) <= ZOOM_CLOSE
 
 
 class ExternalControl(Exception):
@@ -842,7 +868,10 @@ class Hunter:
         self._action: tuple[float, View, tuple[float, float, float, float]] | None = None
         self._last_action = -1e18
         self.activity: deque = deque(maxlen=200)  # (time, direction) where action was, for the choice of views
+        self.nuisance = NuisanceMap()  # where motion is leaves and shadows, by direction, from every view (kept)
         self._quick = False  # this move is to catch action: full speed
+        self._lost = False  # the camera is not where the hunter thinks (see _reposition): stop holding, move on
+        self._track_until = 0.0  # the camera's own tracking is wanted until then (camera_detected)
         self._motion_frames = self._still_frames = self._moving_frames = 0
         # The camera's own detections (gateway: camera_detected): stop, and let its auto-tracking take over.
         self._yield = False
@@ -884,13 +913,21 @@ class Hunter:
             self._ptz_lock.release()
         if self._runaway and self._still_ours(now, where):
             return False
-        if now < self._handed_over_until and self._steady_too_long(now, where):
-            return False
+        if now < self._handed_over_until and now >= self._track_until and self._steady_too_long(now, where):
+            return False  # (not while the camera follows what it detected: someone may walk one way for a minute)
         if abs(angle_delta(where.pan, self._expected.pan)) > 2.5 or abs(where.tilt - self._expected.tilt) > 2.5 \
                 or abs(where.fov - self._expected.fov) > max(2.0, 0.1 * self._expected.fov):
             self._handed_over(now, where, why=f"watcher: expected pan {self._expected.pan:.1f} tilt "
                                               f"{self._expected.tilt:.1f} fov {self._expected.fov:.1f}")
         return now < self._handed_over_until
+
+    def _reposition(self) -> None:
+        """After stopping a move nobody asked for, the camera is somewhere the hunter did not put it (zoomed into the
+        lawn by the camera's tracker, say): forget where it thought it was and move on from wherever it is, so the
+        next move zooms back out. Before, it held on believing it was wide while the camera showed grass at 3.6
+        degrees."""
+        self.status.view = None
+        self._lost = True
 
     def _steady_too_long(self, now: float, where: View, limit_s: float = 60.0) -> bool:
         """Last resort while handed over: a camera that has kept moving the same way for ``limit_s`` is a command left
@@ -913,6 +950,7 @@ class Hunter:
         print(f"{time.strftime('%H:%M:%S')} hunter {self.config.camera_id[:8]} stopped the camera: it kept moving the "
               f"same way for {limit_s:.0f} s while handed over (pan {where.pan:.1f} tilt {where.tilt:.1f})", flush=True)
         self._runaway, self._handed_over_until, self._expected = None, now, None
+        self._reposition()
         self.status.error = self.warning
         return True
 
@@ -940,6 +978,7 @@ class Hunter:
               flush=True)
         self._handed_over_until, self._expected = now, None
         self.status.error = self.warning
+        self._reposition()
         return True
 
     def _handed_over(self, now: float, where: View, unstopped: dict[str, float] | None = None, why: str = "") -> None:
@@ -952,6 +991,9 @@ class Hunter:
             print(f"{time.strftime('%H:%M:%S')} hunter {self.config.camera_id[:8]} handed over: moved by someone else to "
                   f"pan {where.pan:.1f} tilt {where.tilt:.1f} fov {where.fov:.1f}{f' ({why})' if why else ''}", flush=True)
         self._handed_over_until = now + self.config.handback_s
+        if now < self._track_until:  # the camera following what it detected: keep its tracking on while it moves
+            self._track_until = max(self._track_until, now + TRACK_HOLD_S)
+            self._handed_over_until = max(self._handed_over_until, self._track_until)
         self._expected = where  # further movement extends the hand-over
         self.status.view = None
         log_line = f"handed over: camera moved by someone else to pan {where.pan:.1f} tilt {where.tilt:.1f}"
@@ -999,6 +1041,8 @@ class Hunter:
         return {"frames": self._motion_frames, "still_frames": self._still_frames, "moving_frames": self._moving_frames,
                 "watched_here": watch.motion.seen if watch else 0,
                 "boring_cells": sum(1 for b in watch.motion.busy if b >= 0.12 * 255) if watch else 0,
+                "nuisance_directions": sum(1 for b, n in self.nuisance.cells.values() if n >= 60 and b >= 0.06 * 255),
+                "fruitless_chases": len(self.nuisance.chases),
                 "actions": [{"t": t, "pan": v.pan, "tilt": v.tilt} for t, v in list(self.activity)[-5:]],
                 "detections": len(self._tracks)}
 
@@ -1016,14 +1060,73 @@ class Hunter:
                 self.stats[self._watching[0]].motion = self._watching[1].motion.to_json()
             stats = self.stats.get(view)
             self._watching = (view, ActionWatch(ViewMotion.from_json(stats.motion if stats else None)))
-        found = self._watching[1].add(now, cells)
+        where = self._expected or view  # where the camera really is: the world map is by direction
+        found = self._watching[1].add(now, cells, ignore=self.nuisance.busy(where))
+        self.nuisance.observe(where, cells)
+        if found is not None and self._above_horizon(view, found):
+            found = None  # treetops, sky, a roofline: nobody on the ground is up there
         if found is not None and now - self._last_action >= ACTION_COOLDOWN_S:
             self._last_action = now
             spot = aim_at(view, found, self.config.min_fov)
+            if self._fruitless(now, spot):
+                print(f"{time.strftime('%H:%M:%S')} hunter {self.config.camera_id[:8]} motion at pan {spot.pan:.1f} tilt "
+                      f"{spot.tilt:.1f} again, nobody found there: ignored", flush=True)
+                return
+            self.nuisance.chased(now, spot.pan, spot.tilt)  # counts against it unless something is found there
             self.activity.append((now, View.of(spot.pan, spot.tilt, view.fov)))
             self._action = (now, view, found)
             print(f"{time.strftime('%H:%M:%S')} hunter {self.config.camera_id[:8]} action at pan {spot.pan:.1f} tilt "
-                  f"{spot.tilt:.1f}: zooming in to catch it", flush=True)
+                  f"{spot.tilt:.1f}: going to catch it", flush=True)
+
+    def _new_stats(self, view: View) -> ViewStats:
+        """A view first reached by a chase or a move off the known ones: as promising as the nearest known view of
+        about its zoom, not the 0.5 of a view never scored (on Back PTZ, spots that leaf chases landed on in the dark
+        came out 5-10 times as promising as the yard views watched for weeks, and drew the hunter back to the trees)."""
+        near = [(v.distance(view), s) for v, s in self.stats.items()
+                if abs(math.log(max(v.fov, 0.1) / max(view.fov, 0.1))) < 0.7 and v.distance(view) <= view.fov / 2]
+        if not near:
+            return ViewStats()
+        _, nearest = min(near, key=lambda ds: ds[0])
+        return ViewStats(prior=nearest.prior, avoid=nearest.avoid)
+
+    def _fruitful_activity(self) -> list[tuple[float, View]]:
+        """Action that pulls the choice of views: only where something was found after it. A chase that found nobody
+        was leaves or shadows; pulling back to it (twice as hard at night) kept the camera on lit trees in the dark."""
+        kept = []
+        for t, spot in self.activity:
+            found = max([s.last_yes for v, s in self.stats.items()
+                         if abs(angle_delta(v.pan, spot.pan)) <= max(5.0, v.fov / 4)
+                         and abs(v.tilt - spot.tilt) <= max(5.0, v.fov / 4)] + [0.0])
+            if found >= t:
+                kept.append((t, spot))
+        return kept
+
+    def _fruitless(self, now: float, spot: View) -> bool:
+        """Have chases near here found nobody often enough lately (``NuisanceMap.fruitless``), with nothing found
+        near it since? Then it is leaves, a bush or a shadow in the wind: on Back PTZ the same spots drew a chase every
+        few minutes, Clef 0.01 each time, and the count was lost at every restart before it was kept with the map."""
+        # A find at a wide view could be anywhere in it: only one whose centre is near this spot clears it (the camera
+        # detecting a person at home, pan 186 tilt -12, cleared the far yard's leaves at pan 195 tilt -3.5).
+        found = max([stats.last_yes for v, stats in self.stats.items()
+                     if abs(angle_delta(v.pan, spot.pan)) <= max(5.0, v.fov / 4)
+                     and abs(v.tilt - spot.tilt) <= max(5.0, v.fov / 4)] + [0.0])
+        # About a metre on the ground: 5 degrees out in the yard, 10-13 below the camera, where the bushes along the
+        # house drew chases 6-12 degrees apart that never counted as the same place.
+        down = math.radians(min(80.0, max(0.0, -spot.tilt)))
+        radius = max(CHASE_RADIUS, math.degrees(CHASE_SPAN_M * math.tan(down) / self.config.camera_height_m))
+        return self.nuisance.fruitless(now, spot.pan, spot.tilt, found, radius) >= NUISANCE_CHASES
+
+    def _above_horizon(self, view: View, box: tuple[float, float, float, float]) -> bool:
+        """Is this motion at or above the horizon? From a camera mounted above head height a person on the ground is
+        all below it, feet and head, at any distance, and centred well below it (from 3.5 m, 2 degrees at 75 m);
+        at and above it are treetops, sky and rooflines (on Back PTZ, a tree line waving at tilt +2 drew a chase that
+        zoomed in to 4.5 degrees on it, and its foot at tilt 0 another)."""
+        if self.config.camera_height_m <= HEAD_HEIGHT_M or view.tilt is None:
+            return False
+        _, y, _, h = box
+        lowest = view.tilt + (0.5 - (y + h)) * view.fov * 0.75
+        centre = view.tilt + (0.5 - (y + h / 2)) * view.fov * 0.75
+        return lowest > 0.0 or centre > -HORIZON_MARGIN_DEG
 
     def _take_action(self) -> View | None:
         """The view to catch fresh action from the current view at: centred on it, zoomed for its size and distance."""
@@ -1034,9 +1137,10 @@ class Hunter:
         if self.clock() - at > ACTION_FRESH_S or self.status.view != view:
             return None
         aim = aim_at(view, found, self.config.min_fov)
-        far = distant_zoom(aim, self.config, self.home.fov if self.home else view.fov)
-        self.zoom_reason = f"motion at pan {aim.pan:.0f} tilt {aim.tilt:.0f}: zooming in to catch it"
-        return View.of(aim.pan, aim.tilt, min(aim.fov, far) if far else aim.fov)
+        target = self._evidence_view(view, aim)
+        how = "zooming in to catch it" if target.fov < view.fov - FOV_TOL else "centred on it (near: no zoom)"
+        self.zoom_reason = f"motion at pan {aim.pan:.0f} tilt {aim.tilt:.0f}: {how}"
+        return target
 
     def camera_detected(self, now: float, kind: str, track_id: str, last_seen: float) -> None:
         """The camera's own analytics saw what the hunter looks for (gateway: Nx object tracks). That is a find
@@ -1047,7 +1151,9 @@ class Hunter:
         if len(self._tracks) > 500:
             self._tracks = dict(sorted(self._tracks.items(), key=lambda kv: kv[1])[-200:])
         self._yield = True
-        self._handed_over_until = max(self._handed_over_until, max(now, last_seen) + self.config.handback_s)
+        hold = max(now, last_seen) + max(self.config.handback_s, TRACK_HOLD_S)
+        self._track_until = max(self._track_until, hold)
+        self._handed_over_until = max(self._handed_over_until, hold)
         self.zoom_reason = f"the camera detected {kind}: its auto-tracking has it"
         if not fresh:
             return
@@ -1062,6 +1168,15 @@ class Hunter:
         self.status.view = None  # the tracker will move it
         print(f"{time.strftime('%H:%M:%S')} hunter {self.config.camera_id[:8]} camera detected {kind}: handing over "
               f"to its auto-tracking", flush=True)
+
+    def tracking_wanted(self, now: float) -> bool:
+        """Should the camera's own auto-tracking be on? Only while it is following what the hunter found: the
+        hunter's job is to point the camera where it can detect people; once it does, the camera tracks them.
+        Left on while the hunter panned, it took the moving scene for a target and zoomed into the grass. On until
+        ``TRACK_HOLD_S`` after the last detection and after the camera last moved by itself: Back PTZ's person tracks
+        last 1-8 s and break up while it follows someone, and switched off 10 s after the last one, its tracking was
+        cut off mid-follow every time (15:41, 15:42, 18:06 on 20 October)."""
+        return now < self._track_until
 
     def look_at(self, view: View) -> None:
         """Go there next and watch it a while (a search result's "Look there"); the hunt carries on after."""
@@ -1079,7 +1194,7 @@ class Hunter:
             while time.time() < end:
                 if self._stop.wait(min(0.25, end - time.time())):
                     return False
-                if self._action is not None:
+                if self._action is not None or self._lost:
                     break
             return True
         self.sleep(seconds)
@@ -1100,7 +1215,20 @@ class Hunter:
             if not stats.scored and stats.scene >= 0.0:
                 stats.prior, stats.scene = 0.5, -1.0  # to be scored again: neutral until then, so it gets visited
             self.stats[View(row["pan"], row["tilt"], row["fov"])] = stats
+        tight = [v for v, s in self.stats.items() if v.fov < self.config.min_fov - 0.5 and not s.total_hits]
+        for view in tight:  # left by the zoom ratchet (see _go): nothing the hunter would ask for
+            del self.stats[view]
+        if tight:
+            print(f"{time.strftime('%H:%M:%S')} hunter {self.config.camera_id[:8]} dropped {len(tight)} views tighter "
+                  f"than {self.config.min_fov:g} degrees", flush=True)
         self.stats = merge_duplicates(self.stats)
+        unscored = [v for v, st in self.stats.items() if st.prior == ViewStats().prior and st.visits <= 3 and not st.total_hits]
+        for view in unscored:  # left by chases before _new_stats: 0.5, far above the views around them
+            st = self.stats.pop(view)
+            fresh = self._new_stats(view)  # from the views around it, not itself
+            st.prior, st.avoid = fresh.prior, max(st.avoid, fresh.avoid)
+            self.stats[view] = st
+        self.nuisance = NuisanceMap.from_json(data.get("nuisance") if isinstance(data, dict) else None)
         home = data.get("home") if isinstance(data, dict) else None
         return View(home["pan"], home["tilt"], home["fov"]) if home else None
 
@@ -1112,7 +1240,8 @@ class Hunter:
         rows = [{"pan": v.pan, "tilt": v.tilt, "fov": v.fov, "stats": s.to_json()} for v, s in self.stats.items()]
         home = vars(self.home) if self.home else None
         tmp = self.memory.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"version": MEMORY_VERSION, "home": home, "views": rows}))
+        tmp.write_text(json.dumps({"version": MEMORY_VERSION, "home": home, "views": rows,
+                                   "nuisance": self.nuisance.to_json()}))
         tmp.replace(self.memory)
 
     def hot_spots(self, n: int = 5) -> list[tuple[View, ViewStats]]:
@@ -1181,6 +1310,7 @@ class Hunter:
                     break
                 hour = datetime.fromtimestamp(self.clock()).hour
                 visit_started = self.clock()
+                self._lost = False
                 requested, self._requested = self._requested, None
                 action = self._take_action()
                 if action is not None:
@@ -1189,7 +1319,7 @@ class Hunter:
                     self._candidates(), self.status.view, self.clock(), hour, magnets=self.magnets,
                     magnet_weight=self.config.magnet_weight, magnet_radius=self.config.magnet_radius,
                     since_magnet_s=self.clock() - self.last_magnet_visit, magnet_return_s=self.config.magnet_return_s,
-                    recent=list(self.recent), bored_weight=self.config.bored_weight, activity=list(self.activity),
+                    recent=list(self.recent), bored_weight=self.config.bored_weight, activity=self._fruitful_activity(),
                     activity_weight=ACTIVITY_NIGHT if is_night(hour) else ACTIVITY_DAY)
                 try:
                     self._visit(view, survey=False)
@@ -1247,7 +1377,11 @@ class Hunter:
         wide_fov = self.home.fov if self.home else 37.0
         zoomed = {v: s for v, s in self.stats.items() if not self._is_wide(v) and s.avoid < 0.8 and not hopeless(s)
                   and distant_zoom(v, self.config, wide_fov) is not None  # close-ups are for the distance
-                  and s.dull < embedding.DULL_CLOSEUP}  # and for something to see: not lawn, trees, sky...
+                  and s.dull < embedding.DULL_CLOSEUP  # and for something to see: not lawn, trees, sky...
+                  and v.fov >= TOUR_MIN_FOV - 0.5  # and never a tight zoom just to look around
+                  # and not much tighter than its distance calls for: spots from before the distance rule were 6-9
+                  # degrees on lawn 50 m off, where a person fills a sixth of the frame at about 14
+                  and v.fov >= 0.75 * (distant_zoom(v, self.config, wide_fov) or 0.0)}
         if self._mode == "wide" and self.config.zoom_in and zoomed and (
                 now - self._wide_since >= WIDE_AT_MOST_S
                 or (now - self._wide_since >= WIDE_AT_LEAST_S and self._bored_of_wide(now))):
@@ -1341,6 +1475,11 @@ class Hunter:
         # Close enough is the same view; otherwise the spot it is at (an existing view there, else a new one), so what
         # is learned is not spread over copies a degree or two apart.
         actual = View.of(after.pan, after.tilt, after.fov)
+        if actual.fov < self.config.min_fov - 0.5:
+            # Read back tighter than the hunter ever zooms (Back PTZ reads about 3-4 degrees asked for 6): trust the
+            # zoom it asked for. Learned as read, each arrival became a tighter view, and going back to it zoomed in
+            # further: a ratchet that left 72 views at 3-5 degrees on the lawn.
+            actual = View.of(after.pan, after.tilt, max(self.config.min_fov, view.fov))
         arrived = view if same_spot(actual, view) else next((v for v in self.stats if same_spot(actual, v)), actual)
         if arrived != self.status.view:
             self._arrived_at = self.clock()
@@ -1367,22 +1506,40 @@ class Hunter:
         return now
 
     def _move(self, before: View, target: View) -> tuple[View, bool]:
-        """Pan and tilt slowly (the motors are loud); zoom in one quick step (it is silent): out before panning, so the
-        sweep is wide, and in after it, once the spot is centred. Returns (where it is, whether the zoom changed)."""
-        zoom = abs(target.fov - before.fov) > FOV_TOL
-        if zoom and target.fov > before.fov:
-            self.ptz.absolute(View(before.pan, before.tilt, target.fov))
-            now = self._settled_zoom(target.fov)
-        else:
-            now = self.ptz.position()
+        """Pan and tilt slowly (the motors are loud); zoom quickly (it is silent): out before panning, so the sweep is
+        wide, and in after it, once the spot is centred. Returns (where it is, whether the zoom changed)."""
+        zoom = not zoom_close(target.fov, before.fov)
+        now = self._zoom_to(target.fov) if zoom and target.fov > before.fov else self.ptz.position()
         after = move_slowly(self.ptz, View(target.pan, target.tilt, now.fov), self.config.max_speed, sleep=self.sleep,
                             abort=lambda: self._yield, approach_speed=self.config.max_speed if self._quick else 0.0)
         if zoom and target.fov < before.fov:
-            self.ptz.absolute(View(after.pan, after.tilt, target.fov))
-            # Where it arrived is judged on the settled zoom: read a second after zooming in, Back PTZ still reported
-            # 37 degrees, and every close-up look was learned as a look at the wide view it was taken from.
-            after = self._settled_zoom(target.fov)
+            after = self._zoom_to(target.fov)
         return after, zoom
+
+    def _zoom_to(self, fov: float) -> View:
+        """Zoom with continuous commands the hunter stops itself, never an absolute move: Back PTZ (or Nx's logical
+        positioning) kept working on an absolute zoom interrupted by the pan after it and zoomed itself in to 5
+        degrees once the pan stopped, every few minutes, onto the lawn. One timed zoom (``zoom_seconds``), no
+        corrections: the readback is late, and tighter than the zoom at the tele end (6 degrees reads about 3.5), so
+        correcting from it only pumps the zoom. Returns the settled reading."""
+        now = self.ptz.position()
+        if not zoom_close(now.fov, fov):
+            self._zoom_for(zoom_seconds(now.fov, fov), 1.0 if fov < now.fov else -1.0)
+        return self._settled_zoom(fov)
+
+    def _zoom_for(self, seconds: float, direction: float) -> None:
+        """Zoom in (``direction`` 1) or out (-1) for ``seconds``, then stop; stopped early when the camera's own
+        tracking takes over."""
+        self.ptz.continuous(0.0, 0.0, direction * ZOOM_SPEED)
+        try:
+            while seconds > 0 and not self._yield:
+                step = min(0.25, seconds)
+                self.sleep(step)
+                seconds -= step
+        finally:
+            self.ptz.continuous(0.0, 0.0, 0.0)
+        if self._yield:
+            raise ExternalControl(self.ptz.position(), None, "the camera detected what it looks for: its tracking takes over")
 
     def _ask(self, jpeg: bytes | list[bytes], questions: dict) -> Answers | None:
         try:
@@ -1420,7 +1577,7 @@ class Hunter:
             return None
         hunt = {f"t{i}": noul(as_question(text)) for i, text in enumerate(cfg.targets)}
         questions = dict(hunt)
-        stats = self.stats.setdefault(view, ViewStats())
+        stats = self.stats.get(view) or self.stats.setdefault(view, self._new_stats(view))
         self._last_jpeg = jpeg
         embedded = False
         if self.embedder is not None:
@@ -1498,7 +1655,7 @@ class Hunter:
         if any(view.distance(m) <= 5.0 for m in self.magnets):
             self.last_magnet_visit = self.clock()
         result = self._look(survey, view)
-        stats = self.stats.setdefault(view, ViewStats())
+        stats = self.stats.get(view) or self.stats.setdefault(view, self._new_stats(view))
         now, hour = self.clock(), datetime.fromtimestamp(self.clock()).hour
         stats.visits += 1
         stats.last_visit = now
@@ -1520,8 +1677,7 @@ class Hunter:
             self.zoom_reason = (f"a tile looked like {question}: zooming in to check" if spotted
                                 else f"Clef was unsure about {question} ({p:.2f}): zooming in to check")
             aim = aim_at(view, box, cfg.min_fov)
-            far = distant_zoom(aim, cfg, self.home.fov if self.home else view.fov)
-            closer = self._go(View.of(aim.pan, aim.tilt, min(aim.fov, far)) if far else aim)
+            closer = self._go(self._evidence_view(view, aim))
             if closer is None:
                 return
             answers = self._ask(self.ptz.snapshot(), {"t": noul(as_question(question))})
@@ -1547,8 +1703,8 @@ class Hunter:
         self._save()
         if not survey and self._worth_holding(view):
             self._scan_tiles(view, self._last_jpeg)
-            if self._mode == "wide":  # looking around is a quick look at each spot; watching is holding
-                self._hold()
+        if not survey and self._mode == "wide" and self._worth_watching(stats):
+            self._hold()  # a wide view is watched (motion, the camera's windows); close up, a quick look
         if not survey and stats.prior >= 0.6:  # explore around promising views
             half = view.fov * cfg.overlap / 2
             for pan in (view.pan - half, view.pan + half):
@@ -1586,12 +1742,22 @@ class Hunter:
                 if stats.unwanted < 0.0:
                     stats.unwanted = content.unwanted(look["vec"])
 
+    def _evidence_view(self, view: View, aim: View) -> View:
+        """Where to look at something that may be there (Clef unsure, motion): centred on it, zoomed only as far as
+        its distance needs for a person to fill about a sixth of the frame; near, just centred at the current zoom.
+        Zooming to the size of what moved put a 6 degree close-up on a patch of grass."""
+        far = distant_zoom(aim, self.config, self.home.fov if self.home else view.fov)
+        return View.of(aim.pan, aim.tilt, min(view.fov, far) if far is not None else view.fov)
+
     def _distant_child(self, view: View, box: tuple[float, float, float, float]) -> View | None:
         """The close-up of a tile of ``view``: centred on it, zoomed for its distance (``distant_zoom``); None if the
         target would show well there without zooming, or the zoom would hardly be closer than ``view``."""
         spot = aim_at(view, box, self.config.min_fov)
         fov = distant_zoom(spot, self.config, self.home.fov if self.home else view.fov)
-        if fov is None or fov > 0.85 * view.fov:
+        if fov is None:
+            return None
+        fov = max(fov, TOUR_MIN_FOV)
+        if fov > 0.85 * view.fov:
             return None
         return View.of(spot.pan, spot.tilt, fov)
 
@@ -1708,6 +1874,12 @@ class Hunter:
         if p >= self.config.threshold:
             self._window_yes_until = self.clock() + self.config.dwell_s
 
+    def _worth_watching(self, stats: ViewStats) -> bool:
+        """Any wide view worth looking at is worth watching a while: still, the camera takes in the most (motion,
+        its own windows). Judged against the best view overall, a close-up, no wide view qualified and the camera
+        hopped every 15 s."""
+        return stats.avoid < 0.8 and not hopeless(stats)
+
     def _worth_holding(self, view: View, share: float = 0.5) -> bool:
         """Hold only views at least half as promising as the best one now; elsewhere look once and move on."""
         hour = datetime.fromtimestamp(self.clock()).hour
@@ -1730,7 +1902,8 @@ class Hunter:
             return
         phase = self.status.state
         self.status.state = "holding"
-        while not self._stop.is_set() and self.clock() >= self._handed_over_until and self._action is None:
+        while (not self._stop.is_set() and self.clock() >= self._handed_over_until and self._action is None
+               and not self._lost):
             held = self.clock() - self._arrived_at
             if self.clock() < self._window_yes_until and held < cfg.max_dwell_s:
                 pass
