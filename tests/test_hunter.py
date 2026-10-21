@@ -1215,6 +1215,35 @@ def test_fruitless_chases_are_remembered_across_a_restart(tmp_path):
     assert not again._fruitless(600.0, View(145.5, -4.0, 37.0))  # out in the yard the radius stays 5 degrees: one chase
 
 
+def test_a_view_first_reached_by_a_chase_is_as_promising_as_its_neighbour_not_a_fresh_one():
+    hunter, ptz, view = _still_hunter()
+    hunter.stats[view] = ViewStats(prior=0.06, avoid=0.7)  # watched for weeks: little there, mostly trees at night
+    landed = View(198.0, -9.0, 37.0)  # where a leaf chase centred the camera, 8 degrees off it
+    fresh = hunter._new_stats(landed)
+    assert fresh.prior == 0.06 and fresh.avoid == 0.7  # not 0.5: five to ten times the yard views it came from
+    assert hunter._new_stats(View(300.0, -10.0, 37.0)).prior == ViewStats().prior  # nothing known near: unscored
+
+
+def test_views_left_by_chases_at_the_unscored_prior_are_rescored_from_their_neighbours_on_load(tmp_path):
+    ptz = FakePtz(View(190.0, -5.0, 36.9))
+    memory = tmp_path / "hunter.json"
+    hunter = Hunter(HunterConfig("cam"), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now, memory=memory)
+    yard, landed = View(190.0, -5.0, 37.0), View(198.0, -9.0, 37.0)
+    hunter.stats = {yard: ViewStats(prior=0.06, visits=400), landed: ViewStats(visits=1)}  # a leaf chase's view, 0.5
+    hunter._save()
+    again = Hunter(HunterConfig("cam"), ptz, lambda *a: {}, sleep=ptz.sleep, clock=lambda: ptz.now, memory=memory)
+    again._load()
+    assert {v: s.prior for v, s in again.stats.items()} == {yard: 0.06, landed: 0.06}
+
+
+def test_only_action_where_someone_was_then_found_pulls_the_choice_of_views():
+    hunter, ptz, view = _still_hunter()
+    leaves, person = View(198.0, -9.0, 37.0), View(175.0, -6.0, 37.0)
+    hunter.activity.extend([(100.0, leaves), (200.0, person)])
+    hunter.stats[View(176.0, -6.0, 37.0)] = ViewStats(prior=0.3, last_yes=210.0)  # found after the second chase
+    assert hunter._fruitful_activity() == [(200.0, person)]
+
+
 def test_motion_while_the_camera_moves_or_is_handed_over_is_ignored():
     hunter, ptz, view = _still_hunter()
     hunter._handed_over_until = 1e9

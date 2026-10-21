@@ -1078,6 +1078,29 @@ class Hunter:
             print(f"{time.strftime('%H:%M:%S')} hunter {self.config.camera_id[:8]} action at pan {spot.pan:.1f} tilt "
                   f"{spot.tilt:.1f}: going to catch it", flush=True)
 
+    def _new_stats(self, view: View) -> ViewStats:
+        """A view first reached by a chase or a move off the known ones: as promising as the nearest known view of
+        about its zoom, not the 0.5 of a view never scored (on Back PTZ, spots that leaf chases landed on in the dark
+        came out 5-10 times as promising as the yard views watched for weeks, and drew the hunter back to the trees)."""
+        near = [(v.distance(view), s) for v, s in self.stats.items()
+                if abs(math.log(max(v.fov, 0.1) / max(view.fov, 0.1))) < 0.7 and v.distance(view) <= view.fov / 2]
+        if not near:
+            return ViewStats()
+        _, nearest = min(near, key=lambda ds: ds[0])
+        return ViewStats(prior=nearest.prior, avoid=nearest.avoid)
+
+    def _fruitful_activity(self) -> list[tuple[float, View]]:
+        """Action that pulls the choice of views: only where something was found after it. A chase that found nobody
+        was leaves or shadows; pulling back to it (twice as hard at night) kept the camera on lit trees in the dark."""
+        kept = []
+        for t, spot in self.activity:
+            found = max([s.last_yes for v, s in self.stats.items()
+                         if abs(angle_delta(v.pan, spot.pan)) <= max(5.0, v.fov / 4)
+                         and abs(v.tilt - spot.tilt) <= max(5.0, v.fov / 4)] + [0.0])
+            if found >= t:
+                kept.append((t, spot))
+        return kept
+
     def _fruitless(self, now: float, spot: View) -> bool:
         """Have chases near here found nobody often enough lately (``NuisanceMap.fruitless``), with nothing found
         near it since? Then it is leaves, a bush or a shadow in the wind: on Back PTZ the same spots drew a chase every
@@ -1199,6 +1222,12 @@ class Hunter:
             print(f"{time.strftime('%H:%M:%S')} hunter {self.config.camera_id[:8]} dropped {len(tight)} views tighter "
                   f"than {self.config.min_fov:g} degrees", flush=True)
         self.stats = merge_duplicates(self.stats)
+        unscored = [v for v, st in self.stats.items() if st.prior == ViewStats().prior and st.visits <= 3 and not st.total_hits]
+        for view in unscored:  # left by chases before _new_stats: 0.5, far above the views around them
+            st = self.stats.pop(view)
+            fresh = self._new_stats(view)  # from the views around it, not itself
+            st.prior, st.avoid = fresh.prior, max(st.avoid, fresh.avoid)
+            self.stats[view] = st
         self.nuisance = NuisanceMap.from_json(data.get("nuisance") if isinstance(data, dict) else None)
         home = data.get("home") if isinstance(data, dict) else None
         return View(home["pan"], home["tilt"], home["fov"]) if home else None
@@ -1290,7 +1319,7 @@ class Hunter:
                     self._candidates(), self.status.view, self.clock(), hour, magnets=self.magnets,
                     magnet_weight=self.config.magnet_weight, magnet_radius=self.config.magnet_radius,
                     since_magnet_s=self.clock() - self.last_magnet_visit, magnet_return_s=self.config.magnet_return_s,
-                    recent=list(self.recent), bored_weight=self.config.bored_weight, activity=list(self.activity),
+                    recent=list(self.recent), bored_weight=self.config.bored_weight, activity=self._fruitful_activity(),
                     activity_weight=ACTIVITY_NIGHT if is_night(hour) else ACTIVITY_DAY)
                 try:
                     self._visit(view, survey=False)
@@ -1548,7 +1577,7 @@ class Hunter:
             return None
         hunt = {f"t{i}": noul(as_question(text)) for i, text in enumerate(cfg.targets)}
         questions = dict(hunt)
-        stats = self.stats.setdefault(view, ViewStats())
+        stats = self.stats.get(view) or self.stats.setdefault(view, self._new_stats(view))
         self._last_jpeg = jpeg
         embedded = False
         if self.embedder is not None:
@@ -1626,7 +1655,7 @@ class Hunter:
         if any(view.distance(m) <= 5.0 for m in self.magnets):
             self.last_magnet_visit = self.clock()
         result = self._look(survey, view)
-        stats = self.stats.setdefault(view, ViewStats())
+        stats = self.stats.get(view) or self.stats.setdefault(view, self._new_stats(view))
         now, hour = self.clock(), datetime.fromtimestamp(self.clock()).hour
         stats.visits += 1
         stats.last_visit = now

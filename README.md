@@ -252,7 +252,10 @@ Settings can be changed in the Desktop Client or over REST with `Nx.set_engine_s
   before) or moves fast (1.5 cells a second); nothing counts until the view has been watched 30 s. Action cuts the
   hold short: the hunter goes there at full motor speed (no slow approach, no rest), zoomed for the motion's size and
   distance, and Clef looks. Where action was pulls the hunter's choice of view for half an hour, twice as much at
-  night (19:00-07:00), when embeddings and Clef see less. At most one chase every 30 s. Motion at or above the
+  night (19:00-07:00), when embeddings and Clef see less, but only action after which someone was found there
+  pulls: chases of leaves found nobody, and pulling back to them kept the camera on infrared-lit trees after dark.
+  A view first reached by a chase starts as promising as the known view nearest it, not as an unscored one (0.5,
+  5-10 times the yard views around it). At most one chase every 30 s. Motion at or above the
   horizon is never chased (all of it above, or centred less than 2 degrees below): from a camera mounted above head
   height every person on the ground is below it, centred 2 degrees below at 75 m from 3.5 m up, so up there are
   only treetops, sky and rooflines (a tree line at tilt +2 drew a chase that zoomed in to 4.5 degrees, its foot at
