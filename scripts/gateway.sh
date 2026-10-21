@@ -5,8 +5,14 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/bin:$PATH"  # a static ffmpeg in ~/bin on machines without one (the DGX)
 if [[ -f /tmp/clefop_gateway.pid ]] && kill -0 "$(cat /tmp/clefop_gateway.pid)" 2>/dev/null; then
-    kill "$(cat /tmp/clefop_gateway.pid)"
-    sleep 1
+    old="$(cat /tmp/clefop_gateway.pid)"
+    kill "$old"
+    # It stops every PTZ motor and restores cameras' auto-tracking on the way out: wait until it has gone (and
+    # freed the port), or the new one cannot bind and dies.
+    for _ in $(seq 1 30); do
+        kill -0 "$old" 2>/dev/null || break
+        sleep 0.5
+    done
 fi
 nohup python3 -u -m clef_operator.gateway --port 8200 "$@" > /tmp/clefop_gateway.log 2>&1 < /dev/null &
 echo $! > /tmp/clefop_gateway.pid
